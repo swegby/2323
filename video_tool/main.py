@@ -1742,7 +1742,7 @@ _QSS_TEMPLATE = Template("""/* === global type =================================
                  'Roboto', 'Helvetica Neue', Arial, sans-serif;
     outline: none;
 }
-QWidget { background: $bg; color: $text; font-size: 13px; }
+QWidget { background: $bg; color: $text; font-size: 14px; }
 QMainWindow, QDialog { background: $bg; }
 QToolTip {
     background: $surface2; color: $text;
@@ -1772,23 +1772,23 @@ QFrame#CardSep {
 QFrame#SidebarPage { background: transparent; }
 
 /* === labels ================================================= */
-QLabel#CardTitle { font-size: 13px; font-weight: 700; color: $text; letter-spacing: 0.1px; }
-QLabel#AppTitle  { font-size: 18px; font-weight: 800; color: $text; background: transparent; }
-QLabel#SegTitle  { font-size: 16px; font-weight: 700; color: $text; }
+QLabel#CardTitle { font-size: 15px; font-weight: 700; color: $text; letter-spacing: 0.2px; }
+QLabel#AppTitle  { font-size: 20px; font-weight: 800; color: $text; background: transparent; }
+QLabel#SegTitle  { font-size: 17px; font-weight: 700; color: $text; }
 QLabel#CharName  { font-weight: 600; color: $text; }
 QLabel#VerBadge  { color: $accent; background: $accentBg; border: 1px solid $border;
-                   border-radius: 7px; padding: 1px 8px; font-size: 11px; font-weight: 700; }
+                   border-radius: 7px; padding: 2px 9px; font-size: 12px; font-weight: 700; }
 QLabel#SegBadge  { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
                    color: #FFFFFF; font-size: 16px; font-weight: 800; border-radius: 17px; }
-QLabel#CardSub   { color: $text2; font-size: 11px; background: transparent; }
-QLabel#Hint      { color: $text3; font-size: 11px; background: transparent; }
+QLabel#CardSub   { color: $text2; font-size: 12px; background: transparent; }
+QLabel#Hint      { color: $text3; font-size: 12px; background: transparent; }
 QLabel#Info      { color: $text2; background: transparent; }
-QLabel#BigTitle  { font-size: 16px; font-weight: 700; color: $text; }
+QLabel#BigTitle  { font-size: 18px; font-weight: 700; color: $text; }
 QLabel#StatusOk  { color: $ok; font-weight: 600; background: transparent; }
 QLabel#StatusBad { color: $err; font-weight: 600; background: transparent; }
 QLabel#SectionLabel {
-    color: $text2; font-size: 10px; font-weight: 700;
-    letter-spacing: 1.1px; background: transparent; padding-bottom: 2px;
+    color: $text2; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.3px; background: transparent; padding-bottom: 2px;
 }
 
 /* === buttons ================================================ */
@@ -1802,7 +1802,7 @@ QPushButton:pressed { background: $surface2; }
 QPushButton:disabled{ color: $text3; background: $surface1; border-color: $border; }
 
 QPushButton#Primary {
-    color: #FFFFFF; font-weight: 600; font-size: 13px;
+    color: #FFFFFF; font-weight: 600; font-size: 14px;
     border: 1px solid $accent; border-radius: 10px; padding: 9px 22px; min-height: 24px;
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
 }
@@ -1811,14 +1811,14 @@ QPushButton#Primary:pressed { border-color: $accent; }
 QPushButton#Primary:disabled{ background: $surface3; border-color: $border; color: $text3; }
 
 QPushButton#BatchBtn {
-    color: $amberText; font-weight: 700; font-size: 13px;
+    color: $amberText; font-weight: 700; font-size: 14px;
     border: 1px solid $amber; border-radius: 10px; padding: 9px 22px; min-height: 24px;
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $amber, stop:1 $amber2);
 }
 QPushButton#BatchBtn:hover   { border-color: $amber2; }
 QPushButton#BatchBtn:disabled{ background: $surface3; border-color: $border; color: $text3; }
 
-QPushButton#SmallBtn { padding: 5px 11px; font-size: 12px; border-radius: 8px; min-height: 18px; }
+QPushButton#SmallBtn { padding: 6px 12px; font-size: 13px; border-radius: 8px; min-height: 20px; }
 QPushButton#Danger          { color: $err; border: 1px solid $err; background: transparent; }
 QPushButton#Danger:hover    { background: rgba(236,100,121,40); }
 
@@ -1826,7 +1826,7 @@ QPushButton#Danger:hover    { background: rgba(236,100,121,40); }
 QPushButton#CharSelect {
     background: $surface2; color: $text2;
     border: 1px solid $border; border-radius: 11px;
-    padding: 6px 13px; font-size: 12px;
+    padding: 7px 14px; font-size: 13px;
 }
 QPushButton#CharSelect:hover  { background: $surface3; border-color: $borderHi; color: $text; }
 QPushButton#CharSelect:checked{ background: $accentBg; color: $accent; border: 1px solid $accent; font-weight: 600; }
@@ -1835,7 +1835,7 @@ QPushButton#CharSelect:checked{ background: $accentBg; color: $accent; border: 1
 QPushButton#TagChip {
     background: $surface2; color: $text2;
     border: 1px solid $border; border-radius: 9px;
-    padding: 4px 11px; font-size: 11px; max-height: 24px;
+    padding: 5px 12px; font-size: 12px; max-height: 26px;
 }
 QPushButton#TagChip:hover  { background: $surface3; border-color: $borderHi; color: $text; }
 QPushButton#TagChip:checked{ background: $accentBg; color: $accent; border: 1px solid $accent; font-weight: 600; }
@@ -1856,7 +1856,7 @@ QPushButton#ThumbBtn:checked { border: 2px solid $accent; background: $surface2;
 /* === inputs ================================================ */
 QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background: $input; color: $text;
-    border: 1px solid $border; border-radius: 9px; padding: 7px 10px;
+    border: 1px solid $border; border-radius: 9px; padding: 8px 11px;
     selection-background-color: $selection; selection-color: #FFFFFF;
 }
 QLineEdit:hover, QTextEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
@@ -1910,7 +1910,7 @@ QTabWidget#SidebarTabs QTabBar {
 QTabWidget#SidebarTabs QTabBar::tab {
     background: transparent; color: $text2; border: none; border-radius: 9px;
     padding: 9px 8px; margin: 0 1px; min-height: 22px;
-    font-size: 12px; font-weight: 600;
+    font-size: 13px; font-weight: 600;
 }
 QTabWidget#SidebarTabs QTabBar::tab:hover    { background: $surface2; color: $text; }
 QTabWidget#SidebarTabs QTabBar::tab:selected {
@@ -1933,7 +1933,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: t
 /* progress */
 QProgressBar {
     background: $input; border: 1px solid $border; border-radius: 7px;
-    text-align: center; color: $text; font-size: 11px; font-weight: 600; min-height: 18px;
+    text-align: center; color: $text; font-size: 12px; font-weight: 600; min-height: 20px;
 }
 QProgressBar::chunk {
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 $accent, stop:1 $accent2);
@@ -1951,14 +1951,14 @@ QGroupBox::title {
 QPushButton#PlayBtn {
     background: rgba(0,0,0,150); color: #FFFFFF;
     border: 1px solid rgba(255,255,255,90); border-radius: 17px;
-    font-size: 13px; padding: 0;
+    font-size: 14px; padding: 0;
     min-width: 34px; max-width: 34px; min-height: 34px; max-height: 34px;
 }
 QPushButton#PlayBtn:hover { background: rgba(110,139,255,210); border-color: #EDEFF5; }
 QLabel#TimeBadge {
     background: rgba(0,0,0,150); color: #FFFFFF;
     border: 1px solid rgba(255,255,255,70); border-radius: 8px;
-    padding: 2px 8px; font-size: 10px; font-weight: 600;
+    padding: 3px 9px; font-size: 11px; font-weight: 600;
 }
 """)
 
@@ -3479,8 +3479,8 @@ class SidebarCard(QFrame):
         self.main = main_window
         self.setObjectName("Card")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 16)
-        lay.setSpacing(10)
+        lay.setContentsMargins(18, 16, 18, 18)
+        lay.setSpacing(12)
         t = QLabel(title)
         t.setObjectName("CardTitle")
         lay.addWidget(t)
@@ -3494,8 +3494,8 @@ class SidebarCard(QFrame):
         f = QFrame()
         f.setObjectName("Section")
         lay = QVBoxLayout(f)
-        lay.setContentsMargins(12, 10, 12, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(10)
         if title:
             lbl = QLabel(title)
             lbl.setObjectName("SectionLabel")
