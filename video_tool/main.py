@@ -1721,6 +1721,17 @@ QLabel#BigTitle  { font-size: 16px; font-weight: 700; color: #F4F6FB; }
 QLabel#StatusOk  { color: #54C99A; font-weight: 600; background: transparent; }
 QLabel#StatusBad { color: #EC6479; font-weight: 600; background: transparent; }
 
+/* sidebar section captions — clear hierarchy, small tracked label */
+QLabel#SectionLabel {
+    color: #B9C0D4; font-size: 10px; font-weight: 700;
+    letter-spacing: 1.1px; background: transparent; padding-bottom: 2px;
+}
+/* thin divider under a card header */
+QFrame#CardSep {
+    background: #232834; border: none;
+    min-height: 1px; max-height: 1px; margin-top: 2px; margin-bottom: 2px;
+}
+
 /* --- buttons --------------------------------------------------- */
 QPushButton {
     background: #1F2230;
@@ -1857,18 +1868,21 @@ QTabWidget#SidebarTabs::pane { border: none; background: transparent; }
 QTabWidget#SidebarTabs QTabBar {
     background: #111319;
     border: 1px solid #272C39;
-    border-radius: 11px;
+    border-radius: 12px;
     padding: 4px;
 }
 QTabWidget#SidebarTabs QTabBar::tab {
-    background: transparent; color: #A2A8BB;
-    border: none; border-radius: 8px;
-    padding: 8px 12px; margin: 0 1px;
-    font-size: 12px; font-weight: 500;
+    background: transparent; color: #9AA1B6;
+    border: none; border-radius: 9px;
+    padding: 9px 8px; margin: 0 1px;
+    min-height: 22px;
+    font-size: 12px; font-weight: 600;
 }
 QTabWidget#SidebarTabs QTabBar::tab:hover    { background: #1A1D27; color: #EDEFF5; }
 QTabWidget#SidebarTabs QTabBar::tab:selected {
-    background: #232846; color: #D4DEFF; font-weight: 700;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                                stop:0 #6E8BFF, stop:1 #9B73FF);
+    color: #FFFFFF; font-weight: 700;
 }
 
 /* scrollbars — slim, unobtrusive */
@@ -3426,21 +3440,26 @@ class SidebarCard(QFrame):
         self.main = main_window
         self.setObjectName("Card")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(16, 14, 16, 16)
+        lay.setSpacing(10)
         t = QLabel(title)
         t.setObjectName("CardTitle")
         lay.addWidget(t)
+        # subtle divider under the card header — clean settings-panel look
+        sep = QFrame()
+        sep.setObjectName("CardSep")
+        sep.setFixedHeight(1)
+        lay.addWidget(sep)
 
     def _add_section(self, title: str = "") -> QFrame:
         f = QFrame()
         f.setObjectName("Section")
         lay = QVBoxLayout(f)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(12, 10, 12, 12)
+        lay.setSpacing(8)
         if title:
             lbl = QLabel(title)
-            lbl.setObjectName("Hint")
+            lbl.setObjectName("SectionLabel")
             lay.addWidget(lbl)
         self.layout().addWidget(f)
         f._inner = lay
@@ -4638,13 +4657,13 @@ class MainWindow(QMainWindow):
 
         # ---- left sidebar: 4 tabs (each section gets its own scroll) ----
         self.sidebar_host = QWidget()
-        self.sidebar_host.setMinimumWidth(336)
-        self.sidebar_host.setMaximumWidth(400)
+        self.sidebar_host.setMinimumWidth(360)
+        self.sidebar_host.setMaximumWidth(440)
         self.sidebar_host.setSizePolicy(QSizePolicy.Policy.Preferred,
                                         QSizePolicy.Policy.Expanding)
         sbl = QVBoxLayout(self.sidebar_host)
-        sbl.setContentsMargins(0, 0, 0, 0)
-        sbl.setSpacing(0)
+        sbl.setContentsMargins(10, 10, 10, 10)
+        sbl.setSpacing(10)
 
         self.export_card = ExportCard(self)
         self.characters_card = CharactersCard(self)
@@ -4654,6 +4673,13 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs = QTabWidget()
         self.sidebar_tabs.setObjectName("SidebarTabs")
         self.sidebar_tabs.setDocumentMode(True)
+        # Make the 4 nav tabs share the sidebar width evenly so the
+        # segmented control fills edge-to-edge (no trailing empty gap).
+        _sb_tabbar = self.sidebar_tabs.tabBar()
+        _sb_tabbar.setExpanding(True)
+        _sb_tabbar.setDocumentMode(True)
+        _sb_tabbar.setUsesScrollButtons(False)
+        _sb_tabbar.setElideMode(Qt.TextElideMode.ElideNone)
         self._sidebar_pages = []
         for label, card in [
             ("Экспорт", self.export_card),
@@ -4666,7 +4692,15 @@ class MainWindow(QMainWindow):
             page.setFrameShape(QFrame.Shape.NoFrame)
             page.setHorizontalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            page.setWidget(card)
+            # Breathing room around the card so it never touches the tab
+            # bar or the pane edges — the single biggest "refined" win.
+            host = QWidget()
+            host.setObjectName("SidebarPage")
+            hl = QVBoxLayout(host)
+            hl.setContentsMargins(10, 12, 10, 10)
+            hl.setSpacing(0)
+            hl.addWidget(card)
+            page.setWidget(host)
             self.sidebar_tabs.addTab(page, label)
             self._sidebar_pages.append(page)
         sbl.addWidget(self.sidebar_tabs)
