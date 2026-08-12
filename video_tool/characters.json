@@ -1,0 +1,11 @@
+{
+  "bot_token": "8840915156:AAFDWcA38J0PN26xV6EGH4WlMYilHuToCDQ",
+  "auto_send": true,
+  "characters": {
+    "default": {
+      "chat_id": "-1004356927081",
+      "display_name": "default"
+    }
+  },
+  "selected_characters": []
+}

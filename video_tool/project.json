@@ -1,0 +1,159 @@
+{
+  "segments": [
+    {
+      "video": "C:\\Users\\с\\Desktop\\video_tool\\folder_1\\hf_20260809_220116_92c3a6ed-09bd-4104-973a-57e028308647.mp4",
+      "duration": 3.0,
+      "presets": [
+        {
+          "text": "POV: {rand:25-100} seconds ${rand:1.1-2.5:0.1}k. \nNo face cam needed.",
+          "relative_rect": {
+            "x": 0.0286,
+            "y": 0.5737,
+            "w": 0.9603,
+            "h": 0.1451
+          },
+          "font_scale": 0.84,
+          "stroke_width": 3
+        }
+      ],
+      "current_idx": 0,
+      "random_pick": true,
+      "texts": [
+        "POV: {rand:25-100} seconds ${rand:1.1-2.5:0.1}k. \nNo face cam needed."
+      ]
+    },
+    {
+      "video": "C:\\Users\\с\\Desktop\\video_tool\\folder_2\\IMG_2764.MOV",
+      "duration": 1.5,
+      "presets": [
+        {
+          "text": "1. Open Google",
+          "relative_rect": {
+            "x": 0.1442,
+            "y": 0.5858,
+            "w": 0.6766,
+            "h": 0.1545
+          },
+          "font_scale": 1.1,
+          "stroke_width": 2
+        }
+      ],
+      "current_idx": 0,
+      "random_pick": true,
+      "texts": [
+        "1. Open Google"
+      ]
+    },
+    {
+      "video": "C:/Users/с/Desktop/video_tool/folder_3/IMG_2763.MOV",
+      "duration": 1.5,
+      "presets": [
+        {
+          "text": "2. Go to [blue]TOOWERS[/blue]",
+          "relative_rect": {
+            "x": 0.0357,
+            "y": 0.106,
+            "w": 0.8974,
+            "h": 0.145
+          },
+          "font_scale": 1.26,
+          "stroke_width": 2
+        }
+      ],
+      "current_idx": 0,
+      "random_pick": true,
+      "texts": [
+        "2. Go to [blue]TOOWERS[/blue]"
+      ]
+    },
+    {
+      "video": "C:/Users/с/Desktop/video_tool/folder_4/IMG_2765.MOV",
+      "duration": 1.5,
+      "presets": [
+        {
+          "text": "3. Use this",
+          "relative_rect": {
+            "x": 0.1399,
+            "y": 0.6182,
+            "w": 0.75,
+            "h": 0.1788
+          },
+          "font_scale": 1.1,
+          "stroke_width": 2
+        }
+      ],
+      "current_idx": 0,
+      "random_pick": true,
+      "texts": [
+        "3. Use this"
+      ]
+    },
+    {
+      "video": "C:/Users/с/Desktop/video_tool/folder_5/IMG_2762.MOV",
+      "duration": 2.0,
+      "presets": [
+        {
+          "text": "PROFIT",
+          "relative_rect": {
+            "x": 0.07,
+            "y": 0.7342,
+            "w": 0.8,
+            "h": 0.22
+          },
+          "font_scale": 1.1,
+          "stroke_width": 1
+        },
+        {
+          "text": "PROFIT",
+          "relative_rect": {
+            "x": 0.1133,
+            "y": 0.6125,
+            "w": 0.7867,
+            "h": 0.2031
+          },
+          "font_scale": 1.1,
+          "stroke_width": 1
+        }
+      ],
+      "current_idx": 1,
+      "random_pick": true,
+      "texts": [
+        "PROFIT",
+        "PROFIT"
+      ]
+    }
+  ],
+  "export": {
+    "resolution": {
+      "label": "1080×1920 Reels",
+      "w": 1080,
+      "h": 1920
+    },
+    "resolution_index": 0,
+    "force_reels": true,
+    "fps": 30,
+    "audio": true,
+    "uppercase": false,
+    "ten_bit": false,
+    "blur_fill": false,
+    "econ": false,
+    "crf": 23,
+    "preset": "veryfast",
+    "quality_text": "🚀 Скорость CRF23"
+  },
+  "batch": {
+    "enabled": false,
+    "mode": 0,
+    "delete": false,
+    "move": false,
+    "count": 0,
+    "threads": 3
+  },
+  "ui": {
+    "tab": 0,
+    "sidebar_tab": 1,
+    "next_build_index": 0,
+    "video_counter": 18
+  },
+  "ffmpeg_path": ""
+}

@@ -1,0 +1,7 @@
+PyQt6
+moviepy==2.1.2
+Pillow
+imageio-ffmpeg
+numpy
+requests
+proglog
