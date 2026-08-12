@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =====================================================================
-Video Stitcher Pro — Batch Colored Preset Edition v3.0 Aurora UI
+Video Stitcher Pro — Batch Colored Preset Edition v4.0 Aurora UI
 =====================================================================
 Desktop app to assemble vertical Reels / TikTok / Shorts from 5 parts
 with meme text. Works on Windows / Linux / macOS via
@@ -37,6 +37,7 @@ import uuid
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from string import Template
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------- Qt
@@ -46,8 +47,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QFont, QFontMetrics, QImage, QPixmap,
-    QLinearGradient, QPainterPath, QFontDatabase, QAction, QKeySequence,
-    QFontInfo,
+    QIcon, QShortcut, QLinearGradient, QPainterPath, QFontDatabase, QAction,
+    QKeySequence, QFontInfo,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
@@ -74,7 +75,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v3.0"
+APP_VERSION = "v4.0"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1645,219 +1646,257 @@ def run_moviepy(video_paths: List[str],
         return False, str(e)
 
 # ======================================================================
-#  QSS — AURORA DARK THEME (2026)
+#  THEMES — Aurora (dark) + Aurora Light
 # ----------------------------------------------------------------------
-#  "Evolved dark mode": layered surface elevation (4 depths of near-black
-#  with a blue undertone, never flat #000), off-white text, heavier font
-#  weights for legibility on dark, one calm indigo→violet accent. Borders
-#  + soft glows carry depth instead of harsh drop shadows. Generous 8–16px
-#  radii, 4px spacing grid. Tuned for ≥4.5:1 text contrast.
-#
-#  bg-app      #0B0C11   window (deep blue-charcoal, not pure black)
-#  surface-1   #14161E   primary cards
-#  surface-2   #1A1D27   nested sections / inputs
-#  surface-3   #232734   hover / raised
-#  border      #272C39   subtle hairline
-#  border-hi   #383F52   hover / focus edge
-#  text        #EDEFF5   primary  (off-white)
-#  text-2      #A2A8BB   secondary
-#  text-3      #6C7283   muted
-#  accent      #6E8BFF → #9B73FF  (calm indigo→violet)
-#  accent-bg   #232846   selected fill
-#  amber       #F0A93C → #F6BE63  (batch)
-#  ok #54C99A · err #EC6479
+#  Every color is a TOKEN in a palette dict. The QSS is generated from
+#  the active palette via string.Template ($token placeholders — no brace
+#  escaping), and the custom-painted widgets read the same tokens through
+#  tok()/QColor(tok(...)). Switching themes at runtime = swap palette +
+#  regenerate QSS on the QApplication + repaint custom widgets.
 # ======================================================================
 
-QSS = """
-/* --- global type ----------------------------------------------- */
+THEMES: Dict[str, Dict[str, str]] = {
+    "dark": {
+        "bg":        "#0B0C11",
+        "surface1":  "#14161E",
+        "surface2":  "#1A1D27",
+        "surface3":  "#232734",
+        "input":     "#111319",
+        "border":    "#272C39",
+        "borderHi":  "#383F52",
+        "scroll":    "#2F3447",
+        "scrollHi":  "#3C4358",
+        "text":      "#EDEFF5",
+        "text2":     "#A2A8BB",
+        "text3":     "#6C7283",
+        "accent":    "#6E8BFF",
+        "accent2":   "#9B73FF",
+        "accentBg":  "#232846",
+        "amber":     "#F0A93C",
+        "amber2":    "#F6BE63",
+        "amberText": "#221803",
+        "selection": "#3D5BB8",
+        "ok":        "#54C99A",
+        "err":       "#EC6479",
+        "phTop":     "#161A28",
+        "phBot":     "#0E1018",
+        "phIcon":    "#4A5274",
+        "phTitle":   "#D4D9EA",
+        "phSub":     "#828AA8",
+    },
+    "light": {
+        "bg":        "#F5F7FB",
+        "surface1":  "#FFFFFF",
+        "surface2":  "#F1F4FA",
+        "surface3":  "#E7EBF4",
+        "input":     "#FFFFFF",
+        "border":    "#DEE3EE",
+        "borderHi":  "#C4CCDC",
+        "scroll":    "#C4CCDC",
+        "scrollHi":  "#AEB7C9",
+        "text":      "#15171F",
+        "text2":     "#545C7C",
+        "text3":     "#8A92A8",
+        "accent":    "#5B72E8",
+        "accent2":   "#8C63E8",
+        "accentBg":  "#E8ECFE",
+        "amber":     "#D9890C",
+        "amber2":    "#E9A128",
+        "amberText": "#FFFFFF",
+        "selection": "#B9C6FF",
+        "ok":        "#1E9E73",
+        "err":       "#D6395A",
+        "phTop":     "#ECEFF6",
+        "phBot":     "#DEE4F0",
+        "phIcon":    "#AAB2C8",
+        "phTitle":   "#2B3354",
+        "phSub":     "#69728F",
+    },
+}
+
+_ACTIVE_THEME = "dark"
+
+
+def set_active_theme(name: str) -> None:
+    global _ACTIVE_THEME
+    if name in THEMES:
+        _ACTIVE_THEME = name
+
+
+def theme_tokens() -> Dict[str, str]:
+    return THEMES.get(_ACTIVE_THEME, THEMES["dark"])
+
+
+def tok(key: str) -> str:
+    """Current theme token value (hex string)."""
+    return theme_tokens().get(key, "#000000")
+
+
+def theme_name() -> str:
+    return _ACTIVE_THEME
+
+
+_QSS_TEMPLATE = Template("""/* === global type ============================================= */
 * {
     font-family: 'Segoe UI Variable', 'Segoe UI', 'SF Pro Text', 'Inter',
                  'Roboto', 'Helvetica Neue', Arial, sans-serif;
     outline: none;
 }
-QWidget {
-    background: #0B0C11;
-    color: #EDEFF5;
-    font-size: 13px;
-}
-QMainWindow, QDialog { background: #0B0C11; }
-
+QWidget { background: $bg; color: $text; font-size: 13px; }
+QMainWindow, QDialog { background: $bg; }
 QToolTip {
-    background: #1A1D27; color: #EDEFF5;
-    border: 1px solid #383F52; border-radius: 8px; padding: 6px 10px;
+    background: $surface2; color: $text;
+    border: 1px solid $borderHi; border-radius: 8px; padding: 6px 10px;
 }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 
-/* --- cards / surfaces ------------------------------------------ */
+/* === surfaces =============================================== */
 QFrame#Card, QFrame#CardHeader {
-    background: #14161E;
-    border: 1px solid #272C39;
-    border-radius: 16px;
+    background: $surface1; border: 1px solid $border; border-radius: 16px;
 }
 QFrame#Section {
-    background: #1A1D27;
-    border: 1px solid #272C39;
-    border-radius: 12px;
+    background: $surface2; border: 1px solid $border; border-radius: 12px;
 }
 QFrame#CharRow {
-    background: #1A1D27;
-    border: 1px solid #272C39;
-    border-radius: 12px;
+    background: $surface2; border: 1px solid $border; border-radius: 12px;
 }
-QFrame#CharRow:hover { border-color: #383F52; }
+QFrame#CharRow:hover { border-color: $borderHi; }
 QFrame#SegCard {
-    background: #14161E;
-    border: 1px solid #272C39;
-    border-radius: 18px;
+    background: $surface1; border: 1px solid $border; border-radius: 18px;
 }
+QFrame#CardSep {
+    background: $surface3; border: none;
+    min-height: 1px; max-height: 1px; margin: 2px 0;
+}
+QFrame#SidebarPage { background: transparent; }
 
-/* --- labels ---------------------------------------------------- */
-QLabel#CardTitle { font-size: 13px; font-weight: 700; color: #F4F6FB; letter-spacing: 0.1px; }
-QLabel#CardSub   { color: #A2A8BB; font-size: 11px; background: transparent; }
-QLabel#Hint      { color: #6C7283; font-size: 11px; background: transparent; }
-QLabel#Info      { color: #B9BECE; background: transparent; }
-QLabel#BigTitle  { font-size: 16px; font-weight: 700; color: #F4F6FB; }
-QLabel#StatusOk  { color: #54C99A; font-weight: 600; background: transparent; }
-QLabel#StatusBad { color: #EC6479; font-weight: 600; background: transparent; }
-
-/* sidebar section captions — clear hierarchy, small tracked label */
+/* === labels ================================================= */
+QLabel#CardTitle { font-size: 13px; font-weight: 700; color: $text; letter-spacing: 0.1px; }
+QLabel#AppTitle  { font-size: 18px; font-weight: 800; color: $text; background: transparent; }
+QLabel#SegTitle  { font-size: 16px; font-weight: 700; color: $text; }
+QLabel#CharName  { font-weight: 600; color: $text; }
+QLabel#VerBadge  { color: $accent; background: $accentBg; border: 1px solid $border;
+                   border-radius: 7px; padding: 1px 8px; font-size: 11px; font-weight: 700; }
+QLabel#SegBadge  { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
+                   color: #FFFFFF; font-size: 16px; font-weight: 800; border-radius: 17px; }
+QLabel#CardSub   { color: $text2; font-size: 11px; background: transparent; }
+QLabel#Hint      { color: $text3; font-size: 11px; background: transparent; }
+QLabel#Info      { color: $text2; background: transparent; }
+QLabel#BigTitle  { font-size: 16px; font-weight: 700; color: $text; }
+QLabel#StatusOk  { color: $ok; font-weight: 600; background: transparent; }
+QLabel#StatusBad { color: $err; font-weight: 600; background: transparent; }
 QLabel#SectionLabel {
-    color: #B9C0D4; font-size: 10px; font-weight: 700;
+    color: $text2; font-size: 10px; font-weight: 700;
     letter-spacing: 1.1px; background: transparent; padding-bottom: 2px;
 }
-/* thin divider under a card header */
-QFrame#CardSep {
-    background: #232834; border: none;
-    min-height: 1px; max-height: 1px; margin-top: 2px; margin-bottom: 2px;
-}
 
-/* --- buttons --------------------------------------------------- */
+/* === buttons ================================================ */
 QPushButton {
-    background: #1F2230;
-    color: #E6E8F1;
-    border: 1px solid #2F3447;
-    border-radius: 9px;
-    padding: 7px 14px;
-    min-height: 22px;
+    background: $surface2; color: $text;
+    border: 1px solid $border; border-radius: 9px;
+    padding: 7px 14px; min-height: 22px;
 }
-QPushButton:hover  { background: #282C3B; border-color: #3C4358; color: #FFFFFF; }
-QPushButton:pressed{ background: #232634; }
-QPushButton:disabled { color: #5A6072; background: #161821; border-color: #212531; }
+QPushButton:hover   { background: $surface3; border-color: $borderHi; color: $text; }
+QPushButton:pressed { background: $surface2; }
+QPushButton:disabled{ color: $text3; background: $surface1; border-color: $border; }
 
 QPushButton#Primary {
     color: #FFFFFF; font-weight: 600; font-size: 13px;
-    border: 1px solid #5E78E6;
-    border-radius: 10px; padding: 9px 22px; min-height: 24px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #6E8BFF, stop:1 #9B73FF);
+    border: 1px solid $accent; border-radius: 10px; padding: 9px 22px; min-height: 24px;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
 }
-QPushButton#Primary:hover {
-    border-color: #8AA0FF;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #7E97FF, stop:1 #AB85FF);
-}
-QPushButton#Primary:pressed {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #6480F2, stop:1 #8E69F2);
-}
-QPushButton#Primary:disabled { background: #262A38; border-color: #262A38; color: #6C7283; }
+QPushButton#Primary:hover   { border-color: $accent2; }
+QPushButton#Primary:pressed { border-color: $accent; }
+QPushButton#Primary:disabled{ background: $surface3; border-color: $border; color: $text3; }
 
 QPushButton#BatchBtn {
-    color: #221803; font-weight: 700; font-size: 13px;
-    border: 1px solid #E09E2F;
-    border-radius: 10px; padding: 9px 22px; min-height: 24px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #F0A93C, stop:1 #F6BE63);
+    color: $amberText; font-weight: 700; font-size: 13px;
+    border: 1px solid $amber; border-radius: 10px; padding: 9px 22px; min-height: 24px;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $amber, stop:1 $amber2);
 }
-QPushButton#BatchBtn:hover {
-    border-color: #F4B85A;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #F4B14B, stop:1 #FBC977);
-}
-QPushButton#BatchBtn:disabled { background: #2C2818; border-color: #2C2818; color: #8A7A50; }
+QPushButton#BatchBtn:hover   { border-color: $amber2; }
+QPushButton#BatchBtn:disabled{ background: $surface3; border-color: $border; color: $text3; }
 
 QPushButton#SmallBtn { padding: 5px 11px; font-size: 12px; border-radius: 8px; min-height: 18px; }
-QPushButton#Danger { color: #EC6479; border-color: #4A2733; background: #1F1820; }
-QPushButton#Danger:hover { background: #33202A; border-color: #5A2E3D; color: #FF7A90; }
+QPushButton#Danger          { color: $err; border: 1px solid $err; background: transparent; }
+QPushButton#Danger:hover    { background: rgba(236,100,121,40); }
 
 /* selectable character chips */
 QPushButton#CharSelect {
-    background: #1A1D27; color: #B9BECE;
-    border: 1px solid #2F3447; border-radius: 11px;
+    background: $surface2; color: $text2;
+    border: 1px solid $border; border-radius: 11px;
     padding: 6px 13px; font-size: 12px;
 }
-QPushButton#CharSelect:hover  { background: #232734; border-color: #3C4358; color: #EDEFF5; }
-QPushButton#CharSelect:checked {
-    background: #232846; color: #D4DEFF;
-    border: 1px solid #6E8BFF; font-weight: 600;
-}
+QPushButton#CharSelect:hover  { background: $surface3; border-color: $borderHi; color: $text; }
+QPushButton#CharSelect:checked{ background: $accentBg; color: $accent; border: 1px solid $accent; font-weight: 600; }
 
 /* preset tag chips */
 QPushButton#TagChip {
-    background: #1A1D27; color: #B9BECE;
-    border: 1px solid #2F3447; border-radius: 9px;
+    background: $surface2; color: $text2;
+    border: 1px solid $border; border-radius: 9px;
     padding: 4px 11px; font-size: 11px; max-height: 24px;
 }
-QPushButton#TagChip:hover  { background: #232734; border-color: #3C4358; color: #EDEFF5; }
-QPushButton#TagChip:checked {
-    background: #232846; color: #D4DEFF;
-    border: 1px solid #6E8BFF; font-weight: 600;
+QPushButton#TagChip:hover  { background: $surface3; border-color: $borderHi; color: $text; }
+QPushButton#TagChip:checked{ background: $accentBg; color: $accent; border: 1px solid $accent; font-weight: 600; }
+
+/* color swatches (meme colors — neutral ring works in both themes) */
+QPushButton#ColorBtn {
+    border: 2px solid rgba(128,128,128,90); border-radius: 8px; padding: 0;
 }
+QPushButton#ColorBtn:hover { border: 2px solid rgba(255,255,255,170); }
 
 /* filmstrip thumbnails */
 QPushButton#ThumbBtn {
-    background: #111319; border: 2px solid #272C39;
-    border-radius: 13px; padding: 0px;
+    background: $input; border: 2px solid $border; border-radius: 13px; padding: 0px;
 }
-QPushButton#ThumbBtn:hover   { border-color: #3C4358; background: #161922; }
-QPushButton#ThumbBtn:checked { border: 2px solid #6E8BFF; background: #1A1D2C; }
+QPushButton#ThumbBtn:hover   { border-color: $borderHi; background: $surface2; }
+QPushButton#ThumbBtn:checked { border: 2px solid $accent; background: $surface2; }
 
-/* --- inputs ---------------------------------------------------- */
+/* === inputs ================================================ */
 QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    background: #111319; color: #EDEFF5;
-    border: 1px solid #2F3447; border-radius: 9px;
-    padding: 7px 10px;
-    selection-background-color: #3D5BB8; selection-color: #FFFFFF;
+    background: $input; color: $text;
+    border: 1px solid $border; border-radius: 9px; padding: 7px 10px;
+    selection-background-color: $selection; selection-color: #FFFFFF;
 }
 QLineEdit:hover, QTextEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
-    border-color: #3C4358;
+    border-color: $borderHi;
 }
 QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-    border: 1px solid #6E8BFF;
+    border: 1px solid $accent;
 }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow { image: none; width: 0; height: 0; }
 QComboBox QAbstractItemView {
-    background: #1A1D27; border: 1px solid #2F3447;
-    selection-background-color: #232846; selection-color: #D4DEFF;
-    color: #EDEFF5; border-radius: 10px; padding: 5px; outline: 0;
+    background: $surface2; border: 1px solid $border;
+    selection-background-color: $accentBg; selection-color: $accent;
+    color: $text; border-radius: 10px; padding: 5px; outline: 0;
 }
 
 /* checkboxes */
-QCheckBox { spacing: 9px; color: #C2C7D6; background: transparent; }
+QCheckBox { spacing: 9px; color: $text2; background: transparent; }
 QCheckBox::indicator {
     width: 17px; height: 17px; border-radius: 5px;
-    border: 1px solid #2F3447; background: #111319;
+    border: 1px solid $borderHi; background: $input;
 }
-QCheckBox::indicator:hover { border-color: #3C4358; }
+QCheckBox::indicator:hover { border-color: $accent; }
 QCheckBox::indicator:checked {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #6E8BFF, stop:1 #9B73FF);
-    border-color: #6E8BFF;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
+    border-color: $accent;
 }
 
 /* sliders */
-QSlider::groove:horizontal { height: 5px; background: #262B38; border-radius: 3px; }
+QSlider::groove:horizontal { height: 5px; background: $border; border-radius: 3px; }
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #6E8BFF, stop:1 #9B73FF);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 $accent, stop:1 $accent2);
     border-radius: 3px;
 }
-QSlider::add-page:horizontal { background: #262B38; border-radius: 3px; }
+QSlider::add-page:horizontal { background: $border; border-radius: 3px; }
 QSlider::handle:horizontal {
-    background: #EDEFF5; border: 2px solid #6E8BFF;
+    background: #FFFFFF; border: 2px solid $accent;
     width: 14px; height: 14px; margin: -6px 0; border-radius: 9px;
 }
-QSlider::handle:horizontal:hover { background: #FFFFFF; border-color: #8AA0FF; }
+QSlider::handle:horizontal:hover { border-color: $accent2; }
 
 /* tabs */
 QTabWidget::pane { border: none; background: transparent; }
@@ -1866,77 +1905,74 @@ QTabBar::tab { background: transparent; }
 /* sidebar segmented control */
 QTabWidget#SidebarTabs::pane { border: none; background: transparent; }
 QTabWidget#SidebarTabs QTabBar {
-    background: #111319;
-    border: 1px solid #272C39;
-    border-radius: 12px;
-    padding: 4px;
+    background: $input; border: 1px solid $border; border-radius: 12px; padding: 4px;
 }
 QTabWidget#SidebarTabs QTabBar::tab {
-    background: transparent; color: #9AA1B6;
-    border: none; border-radius: 9px;
-    padding: 9px 8px; margin: 0 1px;
-    min-height: 22px;
+    background: transparent; color: $text2; border: none; border-radius: 9px;
+    padding: 9px 8px; margin: 0 1px; min-height: 22px;
     font-size: 12px; font-weight: 600;
 }
-QTabWidget#SidebarTabs QTabBar::tab:hover    { background: #1A1D27; color: #EDEFF5; }
+QTabWidget#SidebarTabs QTabBar::tab:hover    { background: $surface2; color: $text; }
 QTabWidget#SidebarTabs QTabBar::tab:selected {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                                stop:0 #6E8BFF, stop:1 #9B73FF);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 $accent, stop:1 $accent2);
     color: #FFFFFF; font-weight: 700;
 }
 
-/* scrollbars — slim, unobtrusive */
-QScrollBar:vertical   { background: transparent; width: 9px; margin: 2px; }
-QScrollBar::handle:vertical {
-    background: #2F3447; border-radius: 4px; min-height: 32px;
-}
-QScrollBar::handle:vertical:hover { background: #3C4358; }
+/* scrollbars */
+QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
+QScrollBar::handle:vertical { background: $scroll; border-radius: 4px; min-height: 32px; }
+QScrollBar::handle:vertical:hover { background: $scrollHi; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QScrollBar:horizontal { background: transparent; height: 9px; margin: 2px; }
-QScrollBar::handle:horizontal {
-    background: #2F3447; border-radius: 4px; min-width: 32px;
-}
-QScrollBar::handle:horizontal:hover { background: #3C4358; }
+QScrollBar::handle:horizontal { background: $scroll; border-radius: 4px; min-width: 32px; }
+QScrollBar::handle:horizontal:hover { background: $scrollHi; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
 /* progress */
 QProgressBar {
-    background: #111319; border: 1px solid #272C39;
-    border-radius: 7px; text-align: center; color: #EDEFF5;
-    font-size: 11px; font-weight: 600; min-height: 18px;
+    background: $input; border: 1px solid $border; border-radius: 7px;
+    text-align: center; color: $text; font-size: 11px; font-weight: 600; min-height: 18px;
 }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #6E8BFF, stop:1 #9B73FF);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 $accent, stop:1 $accent2);
     border-radius: 6px;
 }
 
-QSplitter::handle { background: #1A1D27; width: 3px; }
-QGroupBox {
-    border: 1px solid #272C39; border-radius: 12px; margin-top: 14px;
-}
+QSplitter::handle { background: $border; width: 3px; }
+QGroupBox { border: 1px solid $border; border-radius: 12px; margin-top: 14px; }
 QGroupBox::title {
     subcontrol-origin: margin; left: 12px; padding: 0 6px;
-    color: #A2A8BB; background: transparent;
+    color: $text2; background: transparent;
 }
 
-/* preview overlay controls */
+/* preview overlay controls — always over a video frame, so dark scrim */
 QPushButton#PlayBtn {
-    background: rgba(11,12,17,170); color: #FFFFFF;
-    border: 1px solid rgba(237,239,245,90);
-    border-radius: 17px; font-size: 13px; padding: 0;
+    background: rgba(0,0,0,150); color: #FFFFFF;
+    border: 1px solid rgba(255,255,255,90); border-radius: 17px;
+    font-size: 13px; padding: 0;
     min-width: 34px; max-width: 34px; min-height: 34px; max-height: 34px;
 }
-QPushButton#PlayBtn:hover {
-    background: rgba(110,139,255,210); border-color: #EDEFF5;
-}
+QPushButton#PlayBtn:hover { background: rgba(110,139,255,210); border-color: #EDEFF5; }
 QLabel#TimeBadge {
-    background: rgba(11,12,17,170); color: #EDEFF5;
-    border: 1px solid rgba(237,239,245,70); border-radius: 8px;
+    background: rgba(0,0,0,150); color: #FFFFFF;
+    border: 1px solid rgba(255,255,255,70); border-radius: 8px;
     padding: 2px 8px; font-size: 10px; font-weight: 600;
 }
-"""
+""")
+
+
+def build_qss(t: Optional[Dict[str, str]] = None) -> str:
+    """Generate the stylesheet for a palette (active theme by default)."""
+    try:
+        return _QSS_TEMPLATE.safe_substitute(t or theme_tokens())
+    except Exception:
+        return _QSS_TEMPLATE.template
+
+
+QSS = build_qss()
+
 
 
 # ======================================================================
@@ -2359,23 +2395,23 @@ class VideoPreviewWidget(QWidget):
         else:
             # empty / loading state — subtle vertical gradient, calm icon
             grad = QLinearGradient(0, 0, 0, H)
-            grad.setColorAt(0, QColor("#161A28"))
-            grad.setColorAt(1, QColor("#0E1018"))
+            grad.setColorAt(0, QColor(tok("phTop")))
+            grad.setColorAt(1, QColor(tok("phBot")))
             p.fillRect(self.rect(), QBrush(grad))
-            p.setPen(QPen(QColor("#4A5274")))
+            p.setPen(QPen(QColor(tok("phIcon"))))
             f = QFont(); f.setPixelSize(int(H * 0.09))
             p.setFont(f)
             p.drawText(QRectF(0, H * 0.27, W, H * 0.12),
                        Qt.AlignmentFlag.AlignCenter, "🎬")
             f2 = QFont(); f2.setPixelSize(int(H * 0.028)); f2.setBold(True)
             p.setFont(f2)
-            p.setPen(QPen(QColor("#D4D9EA")))
+            p.setPen(QPen(QColor(tok("phTitle"))))
             if not self._video_path:
                 p.drawText(QRectF(0, H * 0.40, W, H * 0.06),
                            Qt.AlignmentFlag.AlignCenter, "Видео не выбрано")
                 f3 = QFont(); f3.setPixelSize(int(H * 0.022))
                 p.setFont(f3)
-                p.setPen(QPen(QColor("#828AA8")))
+                p.setPen(QPen(QColor(tok("phSub"))))
                 p.drawText(QRectF(0, H * 0.47, W, H * 0.05),
                            Qt.AlignmentFlag.AlignCenter,
                            "«Выбрать видео» или «Случайное»")
@@ -2385,8 +2421,9 @@ class VideoPreviewWidget(QWidget):
                            "Загрузка видео…" if not self._econ
                            else "Эконом-режим (превью выключено)")
 
-        # safe zones
-        pen = QPen(QColor(255, 255, 255, 46))
+        # safe zones (theme-aware so it's visible on light placeholders too)
+        sz = QColor(tok("text3")); sz.setAlpha(75)
+        pen = QPen(sz)
         pen.setStyle(Qt.PenStyle.DashLine)
         pen.setWidth(1)
         p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
@@ -2604,12 +2641,12 @@ class SegmentThumb(QPushButton):
             p.drawPixmap(r, self._pix)
         else:
             grad = QLinearGradient(0, 0, 0, r.height())
-            grad.setColorAt(0, QColor("#161A28"))
-            grad.setColorAt(1, QColor("#0E1018"))
+            grad.setColorAt(0, QColor(tok("phTop")))
+            grad.setColorAt(1, QColor(tok("phBot")))
             p.fillRect(r, QBrush(grad))
             f = QFont(); f.setPixelSize(int(H * 0.17))
             p.setFont(f)
-            p.setPen(QPen(QColor("#4A5274")))
+            p.setPen(QPen(QColor(tok("phIcon"))))
             p.drawText(QRectF(r), Qt.AlignmentFlag.AlignCenter,
                        "🎬" if not self._has_video else "⏳")
 
@@ -2623,8 +2660,8 @@ class SegmentThumb(QPushButton):
         bd = max(18, min(24, int(W * 0.20)))
         p.setPen(Qt.PenStyle.NoPen)
         grad = QLinearGradient(0, r.y() + 6, bd, r.y() + 6 + bd)
-        grad.setColorAt(0, QColor("#6E8BFF"))
-        grad.setColorAt(1, QColor("#9B73FF"))
+        grad.setColorAt(0, QColor(tok("accent")))
+        grad.setColorAt(1, QColor(tok("accent2")))
         p.setBrush(QBrush(grad))
         p.drawEllipse(QRectF(r.x() + 6, r.y() + 6, bd, bd))
         f = QFont(); f.setPixelSize(int(bd * 0.55)); f.setBold(True)
@@ -2643,7 +2680,7 @@ class SegmentThumb(QPushButton):
                    self._name)
         f2 = QFont(); f2.setPixelSize(max(8, int(H * 0.05)))
         p.setFont(f2)
-        p.setPen(QPen(QColor("#B9BECE")))
+        p.setPen(QPen(QColor(tok("text2"))))
         p.drawText(QRectF(r.x() + 6, r.height() - int(H * 0.11), r.width() - 12,
                           int(H * 0.09)),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -2795,16 +2832,11 @@ class SegmentCard(QFrame):
         badge.setObjectName("SegBadge")
         badge.setFixedSize(34, 34)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setStyleSheet(
-            "QLabel#SegBadge { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
-            " stop:0 #6E8BFF, stop:1 #9B73FF); color: white; font-size: 16px;"
-            " font-weight: 800; border-radius: 17px; }")
         head.addWidget(badge)
         tbox = QVBoxLayout()
         tbox.setSpacing(1)
         title = QLabel(f"Сегмент {self.index + 1}")
-        title.setObjectName("CardTitle")
-        title.setStyleSheet("font-size: 16px;")
+        title.setObjectName("SegTitle")
         tbox.addWidget(title)
         self.video_label = QLabel("видео не выбрано")
         self.video_label.setObjectName("CardSub")
@@ -2980,7 +3012,14 @@ class SegmentCard(QFrame):
         for name in colors:
             b = QPushButton()
             b.setObjectName("ColorBtn")
-            b.setStyleSheet(f"QPushButton#ColorBtn {{ background: {COLOR_MAP[name]}; }}")
+            b.setFixedSize(24, 24)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            # Neutral ring (theme-agnostic) around the meme color, so the
+            # swatch reads as a proper color-picker tile in both themes.
+            b.setStyleSheet(
+                f"QPushButton#ColorBtn {{ background: {COLOR_MAP[name]};"
+                " border: 2px solid rgba(128,128,128,90); border-radius: 8px; }"
+                "QPushButton#ColorBtn:hover { border: 2px solid rgba(255,255,255,200); }")
             b.setToolTip(f"[{name}]…[/{name}]")
             b.clicked.connect(lambda _, n=name: self._insert_color(n))
             self._color_btns.append(b)
@@ -3879,7 +3918,7 @@ class CharactersCard(SidebarCard):
         if name == "default":
             icon = "📁"
         name_lbl = QLabel(f"{icon} {name}")
-        name_lbl.setStyleSheet("font-weight: 600; color: #E8EAF2;")
+        name_lbl.setObjectName("CharName")
         cnt_lbl = QLabel(f"· {count} видео")
         cnt_lbl.setObjectName("CardSub")
         head.addWidget(name_lbl)
@@ -4555,7 +4594,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} — Batch Colored Preset Edition {APP_VERSION}")
         self.setMinimumSize(1280, 860)
         self.resize(1500, 960)
-        self.setStyleSheet(QSS)
 
         self.next_build_index = 0
         self.video_counter = 1
@@ -4564,6 +4602,13 @@ class MainWindow(QMainWindow):
 
         ensure_dirs()
         self.project = load_project()
+        # Pick up the saved theme BEFORE building the UI so any token-based
+        # inline styles are computed with the right palette. (The stylesheet
+        # itself is applied at the QApplication level in main().)
+        _ui = self.project.get("ui", {}) if isinstance(
+            self.project.get("ui", {}), dict) else {}
+        _theme = _ui.get("theme", "dark")
+        set_active_theme(_theme if _theme in THEMES else "dark")
 
         # ---- autosave
         self._save_timer = QTimer(self)
@@ -4580,6 +4625,8 @@ class MainWindow(QMainWindow):
         self._batch_debounce.timeout.connect(self.save_project)
 
         self._build_ui()
+        self.setWindowIcon(self._make_app_icon())
+        self._setup_shortcuts()
         self._load_project_into_ui()
 
         # ---- background jobs at startup
@@ -4592,6 +4639,7 @@ class MainWindow(QMainWindow):
         self._thumb_debounce.timeout.connect(self._refresh_thumbnails)
 
         self._startup_threads()
+        self._update_theme_button()
 
     # ------------------------------------------------------------ UI --
     def _build_ui(self):
@@ -4611,17 +4659,18 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.setSpacing(12)
         title = QLabel(f"🎬  {APP_NAME}")
-        title.setObjectName("CardTitle")
-        title.setStyleSheet(
-            "font-size: 18px; font-weight: 800; color: #F4F6FB; background: transparent;")
+        title.setObjectName("AppTitle")
         ver = QLabel(APP_VERSION)
-        ver.setObjectName("Hint")
-        ver.setStyleSheet(
-            "color: #D4DEFF; background: #232846; border: 1px solid #3A4170;"
-            " border-radius: 7px; padding: 1px 8px; font-size: 11px; font-weight: 700;")
+        ver.setObjectName("VerBadge")
         row1.addWidget(title)
         row1.addWidget(ver)
         row1.addStretch(1)
+        self.btn_theme = QPushButton("🌙")
+        self.btn_theme.setObjectName("SmallBtn")
+        self.btn_theme.setToolTip("Переключить тему (тёмная / светлая)")
+        self.btn_theme.setFixedWidth(42)
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        row1.addWidget(self.btn_theme)
         self.btn_build = QPushButton("▶  Собрать видео")
         self.btn_build.setObjectName("Primary")
         self.btn_build.setToolTip("Собрать одно видео (5 сегментов)")
@@ -4813,6 +4862,7 @@ class MainWindow(QMainWindow):
                 "sidebar_tab": self.sidebar_tabs.currentIndex(),
                 "next_build_index": self.next_build_index,
                 "video_counter": self.video_counter,
+                "theme": theme_name(),
             },
             "ffmpeg_path": load_saved_ffmpeg_path(),
         }
@@ -4860,10 +4910,83 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------ actions --
     def status(self, msg: str, bad: bool = False):
         self.status_label.setText(msg)
-        if bad:
-            self.status_label.setStyleSheet("color: #EC6479;")
+        # Toggle objectName (not an inline color) so the label restyles
+        # automatically with the active theme.
+        self.status_label.setObjectName("StatusBad" if bad else "Info")
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+
+    # ---------------------------------------------------------- theme
+    def _update_theme_button(self):
+        if theme_name() == "dark":
+            self.btn_theme.setText("🌙")
+            self.btn_theme.setToolTip("Включить светлую тему")
         else:
-            self.status_label.setStyleSheet("color: #B9BECE;")
+            self.btn_theme.setText("☀")
+            self.btn_theme.setToolTip("Включить тёмную тему")
+
+    def toggle_theme(self):
+        self.apply_theme("light" if theme_name() == "dark" else "dark")
+
+    def apply_theme(self, name: str):
+        """Live theme switch: swap palette, regenerate the app stylesheet,
+        repaint every custom-painted widget, and persist the choice."""
+        set_active_theme(name if name in THEMES else "dark")
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_qss())
+        self._update_theme_button()
+        try:
+            for card in self.cards:
+                card.preview.update()
+            self.filmstrip.update()
+            for _t in self.filmstrip.thumbs:
+                _t.update()
+        except Exception:
+            pass
+        self.save_project()
+
+    # -------------------------------------------------- icon + shortcuts
+    def _make_app_icon(self) -> QIcon:
+        """Brand icon drawn at runtime — rounded indigo tile with a play
+        glyph. No asset file needed; looks crisp in the taskbar/titlebar."""
+        sz = 64
+        pm = QPixmap(sz, sz)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        g = QLinearGradient(0, 0, sz, sz)
+        g.setColorAt(0, QColor(tok("accent")))
+        g.setColorAt(1, QColor(tok("accent2")))
+        tile = QPainterPath()
+        tile.addRoundedRect(QRectF(0, 0, sz, sz), 16, 16)
+        p.fillPath(tile, QBrush(g))
+        tri = QPainterPath()
+        d = sz * 0.20
+        tri.moveTo(sz / 2 - d * 0.55, sz / 2 - d)
+        tri.lineTo(sz / 2 + d * 0.95, sz / 2)
+        tri.lineTo(sz / 2 - d * 0.55, sz / 2 + d)
+        tri.closeSubpath()
+        p.fillPath(tri, QColor("#FFFFFF"))
+        p.end()
+        return QIcon(pm)
+
+    def _setup_shortcuts(self):
+        """Pro-feel keyboard shortcuts."""
+        def _seq(seq, fn):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(fn)
+            return sc
+        _seq("Ctrl+B", self.on_build)
+        _seq("Ctrl+Shift+B", self.on_build_batch)
+        _seq("Ctrl+S", self._shortcut_save)
+        _seq("Ctrl+T", self.toggle_theme)
+        for i in range(1, 6):
+            _seq(str(i), lambda k=(i - 1): self._select_segment(k))
+
+    def _shortcut_save(self):
+        self.save_project()
+        self.status("💾 Проект сохранён")
 
     def on_build(self):
         if self._busy:
@@ -5108,6 +5231,9 @@ def main():
     # uses the real display face (not a thin fallback) — preview == output.
     register_fonts_in_qt()
     win = MainWindow()
+    # Apply the active theme's stylesheet at the application level (the
+    # theme was chosen inside MainWindow.__init__ from project.json).
+    QApplication.instance().setStyleSheet(build_qss())
     win.show()
     sys.exit(app.exec())
 
