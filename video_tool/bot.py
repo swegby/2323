@@ -529,7 +529,11 @@ def show_summary(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
 
 
 def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
-    chat_id = msg["chat"]["id"]
+    chat = msg.get("chat") or {}
+    # ---- работаем ТОЛЬКО в личке: группы/каналы полностью игнорим ----
+    if chat.get("type") != "private":
+        return
+    chat_id = chat["id"]
     text = (msg.get("text") or "").strip()
     s = get_session(chat_id)
 
@@ -538,6 +542,11 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
         return
     if text.startswith("/cancel"):
         show_main_menu(tg, chat_id)
+        return
+
+    # не-текстовые сообщения (видео, фото, стикеры, сервисные) — игнорим,
+    # чтобы бот не спамил меню в ответ на всё подряд
+    if not text:
         return
 
     state = s.get("state", "idle")
@@ -589,9 +598,14 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
 
 
 def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
-    chat_id = cb["message"]["chat"]["id"]
-    data = cb.get("data", "")
+    chat = (cb.get("message") or {}).get("chat") or {}
     cb_id = cb["id"]
+    # ---- только личка ----
+    if chat.get("type") != "private":
+        tg.answer_cb(cb_id)
+        return
+    chat_id = chat["id"]
+    data = cb.get("data", "")
     s = get_session(chat_id)
 
     if chat_id in busy_chats and data == "go":
@@ -732,7 +746,16 @@ def main() -> None:
         sys.exit(1)
     print(f"✅ Бот @{me['result'].get('username')} запущен. Ctrl+C — стоп.")
 
+    # ---- пропускаем накопившийся бэклог апдейтов, чтобы бот не
+    #      спамил ответами на старые сообщения после перезапуска ----
     offset = 0
+    try:
+        j = tg.call("getUpdates", **{"offset": -1, "timeout": 0})
+        if j.get("ok") and j.get("result"):
+            offset = j["result"][-1]["update_id"] + 1
+            print(f"⏭ Пропущено старых апдейтов до #{offset - 1}")
+    except Exception:
+        pass
     while True:
         try:
             updates = tg.get_updates(offset)
