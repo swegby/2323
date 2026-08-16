@@ -92,10 +92,10 @@ _ensure_qt()
 # --- рендер-движок и хелперы из основного приложения -----------------
 from main import (
     BASE_DIR, FOLDER_DIRS, FOLDERS, OUTPUT_DIR,
-    DEFAULT_PRESET,
+    DEFAULT_PRESET, VIDEO_EXTS,
     ensure_dirs, natural_key, list_videos,
     load_project, load_characters, save_characters,
-    get_ffmpeg_exe, is_valid_ffmpeg,
+    get_ffmpeg_exe, is_valid_ffmpeg, get_video_duration,
     build_one_final_ffmpeg, download_fonts,
     FONT_ANTON, FONT_OSWALD,
 )
@@ -180,6 +180,32 @@ class Tg:
     def send_action(self, chat_id: int, action: str = "upload_document") -> None:
         self.call("sendChatAction", chat_id=chat_id, action=action)
 
+    def get_file_path(self, file_id: str) -> Optional[str]:
+        j = self.call("getFile", file_id=file_id)
+        if j.get("ok"):
+            return (j.get("result") or {}).get("file_path")
+        return None
+
+    def download_file(self, file_path: str, dest: str) -> bool:
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        try:
+            with requests.get(url, stream=True, timeout=600) as r:
+                if not r.ok:
+                    return False
+                tmp = dest + ".part"
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(tmp, dest)
+            return os.path.isfile(dest) and os.path.getsize(dest) > 0
+        except Exception:
+            try:
+                os.remove(dest + ".part")
+            except Exception:
+                pass
+            return False
+
 
 # ======================================================================
 #  ПАПКИ ЮЗЕРА (подпапки folder_1)
@@ -251,11 +277,14 @@ def fmt_dur(vals: List[float]) -> str:
 #  СОСТОЯНИЯ ДИАЛОГА
 # ======================================================================
 # sessions[chat_id] = {
-#   "state": idle | new_folder | count | durations | ready
+#   "state": idle | new_folder | count | durations | ready |
+#            upload_pick | upload_newfolder | upload | keep_hook_limit
 #   "sel": set(имена выбранных папок), "menu_id": int|None,
 #   "folders": [(path, name), ...] — выбранные для генерации,
 #   "count": int (видео НА КАЖДУЮ папку),
 #   "delete": bool|None, "rand_body": bool|None, "rand_hook": bool|None,
+#   "keep_hook": bool, "keep_hook_max": float — хук как есть, если <= X сек,
+#   "upload_folder": (path, name), "uploaded": int,
 #   "durs": [float]*n
 # }
 
@@ -293,6 +322,7 @@ def kb_main(sel: Optional[set] = None) -> List[List[Dict[str, str]]]:
                     "callback_data": "next"}])
     kb.append([{"text": "➕ Создать папку", "callback_data": "newfolder"},
                {"text": "🔄 Обновить", "callback_data": "refresh"}])
+    kb.append([{"text": "📤 Загрузить хуки", "callback_data": "upload"}])
     return kb
 
 
@@ -302,16 +332,21 @@ def main_menu_text(sel: Optional[set] = None) -> str:
     pools = body_pools()
     lines = ["<b>🎬 Video Stitcher Bot</b>", ""]
     if folders:
-        lines.append("Выбери одну или несколько папок (клик = ✅), "
-                     "потом жми «▶️ Далее»:")
-        if sel:
-            lines.append("Выбрано: " + ", ".join(f"<b>{n}</b>" for n in sorted(sel)))
+        lines.append("<b>📁 Папки (хуки):</b>")
+        for _p, name, n in folders:
+            mark = "✅ " if name in sel else "• "
+            lines.append(f"{mark}{name} — <b>{n}</b> видео")
+        lines.append("")
+        lines.append("Клик по папке = ✅ выбрать, потом «▶️ Далее».")
+        lines.append("📤 «Загрузить хуки» — закинуть видео прямо из Telegram.")
     else:
         lines.append("Папок пока нет — нажми «➕ Создать папку»,")
-        lines.append(f"потом закинь видео в <code>folder_1/&lt;имя&gt;/</code>.")
+        lines.append("потом загрузи хуки кнопкой «📤 Загрузить хуки» "
+                     "или закинь файлы в <code>folder_1/&lt;имя&gt;/</code>.")
     lines.append("")
-    body = " · ".join(f"{FOLDERS[i+1]}: {len(p)}" for i, p in enumerate(pools))
-    lines.append(f"Тело ролика: {body}")
+    body = " · ".join(f"{FOLDERS[i+1]}: <b>{len(p)}</b>"
+                      for i, p in enumerate(pools))
+    lines.append(f"🎞 Тело ролика: {body}")
     return "\n".join(lines)
 
 
@@ -324,6 +359,12 @@ def kb_yes_no(prefix: str, yes: str, no: str) -> List[List[Dict[str, str]]]:
 def summary_text(s: Dict[str, Any]) -> str:
     names = [name for _p, name in s["folders"]]
     total = s["count"] * len(names)
+    if s.get("keep_hook"):
+        hook_line = (f"🎬 Хук без изменений: <b>да, если ≤ "
+                     f"{s.get('keep_hook_max', 3.5):.3f}с</b> "
+                     "(не ускоряется/не режется)")
+    else:
+        hook_line = "🎬 Хук без изменений: <b>нет, подгоняется под длительность</b>"
     return "\n".join([
         "<b>📋 Заказ</b>",
         f"📁 Папки (хуки): <b>{', '.join(names)}</b>",
@@ -331,6 +372,7 @@ def summary_text(s: Dict[str, Any]) -> str:
         f"🗑 Удаление из folder_2-5: <b>{'да' if s['delete'] else 'нет'}</b>",
         f"🎲 Рандом видео из папок 2-5: <b>{'да' if s['rand_body'] else 'по порядку'}</b>",
         f"🎣 Рандом хук из своей папки: <b>{'да' if s['rand_hook'] else 'по порядку'}</b>",
+        hook_line,
         f"⏱ Длительности: <b>{fmt_dur(s['durs'])}</b>",
         "🧹 Метаданные: <b>очищаются полностью</b>",
         "💎 Отправка: <b>документом, без сжатия</b>",
@@ -400,6 +442,8 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     delete: bool = s["delete"]
     rand_body: bool = s["rand_body"]
     rand_hook: bool = s["rand_hook"]
+    keep_hook: bool = bool(s.get("keep_hook"))
+    keep_hook_max: float = float(s.get("keep_hook_max", 3.5) or 3.5)
     durs: List[float] = s["durs"]
 
     status_id = tg.send(chat_id, "⏳ Готовлюсь к сборке…")
@@ -459,13 +503,22 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                     continue
 
                 # ---------- 1) собираем ВСЕ видео этой папки ----------
-                ready: List[str] = []
+                ready: List[Tuple[str, List[float]]] = []
                 for i in range(real_count):
                     status(f"🎬 [{fi}/{n_folders}] Папка «{folder_name}»: "
                            f"собираю {i + 1}/{real_count}…")
 
                     hook = (random.choice(hooks) if rand_hook
                             else hooks[i % len(hooks)])
+
+                    # ---- 🎬 хук без изменений: если он не длиннее лимита,
+                    #      сегмент 1 получает длительность = длине хука
+                    #      (не ускоряется, не замедляется, не режется)
+                    cur_durs = list(durs)
+                    if keep_hook:
+                        hd = get_video_duration(hook, ff)
+                        if 0.05 < hd <= keep_hook_max + 0.005:
+                            cur_durs[0] = round(hd, 3)
 
                     vps = [hook]
                     used_body: List[str] = []
@@ -493,7 +546,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                         k += 1
 
                     ok, err = build_one_final_ffmpeg(
-                        vps, presets, durs, out_path, ff,
+                        vps, presets, cur_durs, out_path, ff,
                         resolution=(res_w, res_h) if res_w and res_h
                         else (1080, 1920),
                         fps=fps, crf=crf, preset=preset,
@@ -507,7 +560,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
 
                     # ---- 🧹 полная очистка метаданных (без потери качества)
                     clean_metadata(out_path, ff)
-                    ready.append(out_path)
+                    ready.append((out_path, cur_durs))
                     total_made += 1
 
                     # ---- удаление использованных из folder_2-5 ----
@@ -529,10 +582,10 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                     tg.send(chat_id,
                             f"📁 <b>{folder_name}</b> готова — "
                             f"{len(ready)} видео 👇")
-                    for k, fp in enumerate(ready, start=1):
+                    for k, (fp, fdurs) in enumerate(ready, start=1):
                         tg.send_action(chat_id)
                         cap = (f"📁 {folder_name} • {k}/{len(ready)}\n"
-                               f"⏱ {fmt_dur(durs)} • 🧹 без метаданных")
+                               f"⏱ {fmt_dur(fdurs)} • 🧹 без метаданных")
                         oks, info = tg.send_document(chat_id, fp, cap)
                         if oks:
                             total_sent += 1
@@ -593,6 +646,80 @@ def default_durations() -> List[float]:
     return out
 
 
+def start_upload(tg: Tg, chat_id: int, s: Dict[str, Any],
+                 path: str, name: str) -> None:
+    s["state"] = "upload"
+    s["upload_folder"] = (path, name)
+    s["uploaded"] = 0
+    kb = [[{"text": "✅ Готово", "callback_data": "updone"}],
+          [{"text": "❌ Отмена", "callback_data": "cancel"}]]
+    tg.send(chat_id,
+            f"📤 Кидай видео-хуки в чат — сохраню в папку <b>{name}</b>.\n"
+            "Можно несколько подряд (видео или файлом-документом).\n"
+            f"⚠️ Лимит Telegram для ботов — до ~20 МБ на файл.\n"
+            "Когда закончишь — жми «✅ Готово».", kb)
+
+
+def extract_incoming_video(msg: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Из сообщения достаёт (file_id, имя файла) для видео/док-видео."""
+    v = msg.get("video")
+    if isinstance(v, dict) and v.get("file_id"):
+        name = v.get("file_name") or f"hook_{int(time.time()*1000)}.mp4"
+        return v["file_id"], name
+    d = msg.get("document")
+    if isinstance(d, dict) and d.get("file_id"):
+        name = d.get("file_name") or ""
+        mime = str(d.get("mime_type") or "")
+        ext = os.path.splitext(name)[1].lower()
+        if mime.startswith("video/") or ext in VIDEO_EXTS:
+            if not name:
+                name = f"hook_{int(time.time()*1000)}.mp4"
+            return d["file_id"], name
+    a = msg.get("animation")
+    if isinstance(a, dict) and a.get("file_id"):
+        name = a.get("file_name") or f"hook_{int(time.time()*1000)}.mp4"
+        return a["file_id"], name
+    return None
+
+
+def save_incoming_video(tg: Tg, chat_id: int, s: Dict[str, Any],
+                        msg: Dict[str, Any]) -> None:
+    """Скачивает присланное видео в выбранную папку загрузки."""
+    got = extract_incoming_video(msg)
+    if not got:
+        tg.send(chat_id, "❌ Это не видео. Кидай видео или видео-файлом, "
+                         "или жми «✅ Готово».")
+        return
+    file_id, fname = got
+    path, name = s["upload_folder"]
+    os.makedirs(path, exist_ok=True)
+
+    base = safe_folder_name(os.path.splitext(os.path.basename(fname))[0]) or "hook"
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in VIDEO_EXTS:
+        ext = ".mp4"
+    dest = os.path.join(path, base + ext)
+    k = 1
+    while os.path.exists(dest):
+        dest = os.path.join(path, f"{base}_{k:03d}{ext}")
+        k += 1
+
+    fp = tg.get_file_path(file_id)
+    if not fp:
+        tg.send(chat_id, "❌ Не смог получить файл (возможно, больше 20 МБ — "
+                         "лимит Telegram для ботов). Закинь его руками в "
+                         f"<code>folder_1/{name}/</code>.")
+        return
+    if not tg.download_file(fp, dest):
+        tg.send(chat_id, "❌ Ошибка скачивания, попробуй ещё раз.")
+        return
+    s["uploaded"] = s.get("uploaded", 0) + 1
+    total = len(list_videos(path))
+    tg.send(chat_id, f"✅ Сохранил как <code>{os.path.basename(dest)}</code> "
+                     f"→ 📁 <b>{name}</b> (всего в папке: {total}). "
+                     "Кидай ещё или жми «✅ Готово».")
+
+
 def ask_durations(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     s["state"] = "durations"
     dd = default_durations()
@@ -630,12 +757,17 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
         show_main_menu(tg, chat_id)
         return
 
+    state = s.get("state", "idle")
+
+    # ---- 📤 режим загрузки: принимаем видео-сообщения ----
+    if state == "upload" and not text:
+        save_incoming_video(tg, chat_id, s, msg)
+        return
+
     # не-текстовые сообщения (видео, фото, стикеры, сервисные) — игнорим,
     # чтобы бот не спамил меню в ответ на всё подряд
     if not text:
         return
-
-    state = s.get("state", "idle")
 
     if state == "new_folder":
         name = safe_folder_name(text)
@@ -646,8 +778,33 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
         os.makedirs(path, exist_ok=True)
         tg.send(chat_id,
                 f"✅ Папка <b>{name}</b> создана.\n"
-                f"Закинь видео в <code>folder_1/{name}/</code> и жми «🔄 Обновить».")
+                f"Закинь видео в <code>folder_1/{name}/</code>, или грузи "
+                "прямо из Telegram — кнопка «📤 Загрузить хуки».")
         show_main_menu(tg, chat_id)
+        return
+
+    if state == "upload_newfolder":
+        name = safe_folder_name(text)
+        if not name:
+            tg.send(chat_id, "❌ Некорректное имя, попробуй ещё раз.")
+            return
+        path = os.path.join(FOLDER_DIRS[0], name)
+        os.makedirs(path, exist_ok=True)
+        start_upload(tg, chat_id, s, path, name)
+        return
+
+    if state == "keep_hook_limit":
+        try:
+            lim = round(float(text.replace(",", ".")), 3)
+        except Exception:
+            tg.send(chat_id, "❌ Отправь число в секундах, например "
+                             "<code>3.5</code>.")
+            return
+        if lim <= 0 or lim > 600:
+            tg.send(chat_id, "❌ От 0.001 до 600 секунд.")
+            return
+        s["keep_hook_max"] = lim
+        ask_durations(tg, chat_id, s)
         return
 
     if state == "count":
@@ -677,6 +834,10 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
             return
         s["durs"] = durs
         show_summary(tg, chat_id, s)
+        return
+
+    if state == "upload":
+        tg.send(chat_id, "📤 Кидай видео, или жми «✅ Готово» / /cancel.")
         return
 
     # idle / прочее
@@ -712,6 +873,55 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         tg.answer_cb(cb_id)
         s["state"] = "new_folder"
         tg.send(chat_id, "✏️ Напиши имя новой папки (например <code>1</code>):")
+        return
+
+    # ---------- 📤 загрузка хуков из Telegram ----------
+    if data == "upload":
+        tg.answer_cb(cb_id)
+        s["state"] = "upload_pick"
+        kb: List[List[Dict[str, str]]] = []
+        for i, (_p, name, n) in enumerate(user_folders()):
+            kb.append([{"text": f"📁 {name}  ({n} видео)",
+                        "callback_data": f"up:{i}"}])
+        kb.append([{"text": "➕ Новая папка", "callback_data": "upnew"}])
+        kb.append([{"text": "❌ Отмена", "callback_data": "cancel"}])
+        tg.send(chat_id,
+                "📤 <b>Загрузка хуков</b>\nВ какую папку грузим? "
+                "Выбери существующую или создай новую:", kb)
+        return
+
+    if data == "upnew":
+        tg.answer_cb(cb_id)
+        s["state"] = "upload_newfolder"
+        tg.send(chat_id, "✏️ Напиши имя новой папки для хуков:")
+        return
+
+    if data.startswith("up:"):
+        tg.answer_cb(cb_id)
+        if s.get("state") != "upload_pick":
+            return
+        try:
+            idx = int(data.split(":")[1])
+        except Exception:
+            return
+        folders = user_folders()
+        if idx < 0 or idx >= len(folders):
+            tg.send(chat_id, "❌ Папка не найдена, обнови меню.")
+            show_main_menu(tg, chat_id)
+            return
+        path, name, _n = folders[idx]
+        start_upload(tg, chat_id, s, path, name)
+        return
+
+    if data == "updone":
+        tg.answer_cb(cb_id)
+        if s.get("state") != "upload":
+            return
+        n = s.get("uploaded", 0)
+        name = s["upload_folder"][1] if s.get("upload_folder") else "?"
+        tg.send(chat_id, f"✅ Загрузка в <b>{name}</b> завершена: "
+                         f"+{n} видео.")
+        show_main_menu(tg, chat_id)
         return
 
     if data.startswith("f:"):
@@ -797,6 +1007,45 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_hook":
             return
         s["rand_hook"] = data.endswith(":1")
+        s["state"] = "wait_keep"
+        tg.send(chat_id,
+                "🎬 <b>Хук без изменений?</b>\n"
+                "Если видео-хук не длиннее лимита — оставить его как есть: "
+                "не ускорять, не замедлять, не резать (длительность 1-го "
+                "участка тогда = длине хука):",
+                kb_yes_no("keep",
+                          "🎬 Да, оставить как есть (если ≤ лимита)",
+                          "⏱ Нет, подгонять под длительность"))
+        return
+
+    if data.startswith("keep:"):
+        tg.answer_cb(cb_id)
+        if s.get("state") != "wait_keep":
+            return
+        if data.endswith(":1"):
+            s["keep_hook"] = True
+            s["state"] = "keep_hook_limit"
+            kb = [[{"text": "✅ Лимит 3.5 сек", "callback_data": "keeplim:3.5"}],
+                  [{"text": "❌ Отмена", "callback_data": "cancel"}]]
+            tg.send(chat_id,
+                    "⏱ <b>Максимальная длина хука</b> для режима «как есть».\n"
+                    "Отправь число в секундах (например <code>3.5</code> или "
+                    "<code>4.250</code>) — если хук длиннее, он будет "
+                    "подгоняться как обычно:",
+                    kb)
+        else:
+            s["keep_hook"] = False
+            ask_durations(tg, chat_id, s)
+        return
+
+    if data.startswith("keeplim:"):
+        tg.answer_cb(cb_id)
+        if s.get("state") != "keep_hook_limit":
+            return
+        try:
+            s["keep_hook_max"] = float(data.split(":")[1])
+        except Exception:
+            s["keep_hook_max"] = 3.5
         ask_durations(tg, chat_id, s)
         return
 
