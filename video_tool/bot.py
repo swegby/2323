@@ -33,6 +33,7 @@ import sys
 import json
 import time
 import random
+import subprocess
 import threading
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
@@ -251,9 +252,11 @@ def fmt_dur(vals: List[float]) -> str:
 # ======================================================================
 # sessions[chat_id] = {
 #   "state": idle | new_folder | count | durations | ready
-#   "folder": (path, name), "count": int,
+#   "sel": set(имена выбранных папок), "menu_id": int|None,
+#   "folders": [(path, name), ...] — выбранные для генерации,
+#   "count": int (видео НА КАЖДУЮ папку),
 #   "delete": bool|None, "rand_body": bool|None, "rand_hook": bool|None,
-#   "durs": [float]*n, "msg_id": int|None
+#   "durs": [float]*n
 # }
 
 sessions: Dict[int, Dict[str, Any]] = {}
@@ -277,21 +280,32 @@ def reset_session(chat_id: int) -> Dict[str, Any]:
 #  ЭКРАНЫ / КЛАВИАТУРЫ
 # ======================================================================
 
-def kb_main() -> List[List[Dict[str, str]]]:
+def kb_main(sel: Optional[set] = None) -> List[List[Dict[str, str]]]:
+    """Мульти-выбор папок: клик = toggle галочки, потом «Далее»."""
+    sel = sel or set()
     kb: List[List[Dict[str, str]]] = []
     for i, (_p, name, n) in enumerate(user_folders()):
-        kb.append([{"text": f"📁 {name}  ({n} видео)", "callback_data": f"f:{i}"}])
+        mark = "✅ " if name in sel else ""
+        kb.append([{"text": f"{mark}📁 {name}  ({n} видео)",
+                    "callback_data": f"f:{i}"}])
+    if sel:
+        kb.append([{"text": f"▶️ Далее ({len(sel)} папок)",
+                    "callback_data": "next"}])
     kb.append([{"text": "➕ Создать папку", "callback_data": "newfolder"},
                {"text": "🔄 Обновить", "callback_data": "refresh"}])
     return kb
 
 
-def main_menu_text() -> str:
+def main_menu_text(sel: Optional[set] = None) -> str:
+    sel = sel or set()
     folders = user_folders()
     pools = body_pools()
     lines = ["<b>🎬 Video Stitcher Bot</b>", ""]
     if folders:
-        lines.append("Выбери папку, из которой собрать видео (хуки):")
+        lines.append("Выбери одну или несколько папок (клик = ✅), "
+                     "потом жми «▶️ Далее»:")
+        if sel:
+            lines.append("Выбрано: " + ", ".join(f"<b>{n}</b>" for n in sorted(sel)))
     else:
         lines.append("Папок пока нет — нажми «➕ Создать папку»,")
         lines.append(f"потом закинь видео в <code>folder_1/&lt;имя&gt;/</code>.")
@@ -308,21 +322,60 @@ def kb_yes_no(prefix: str, yes: str, no: str) -> List[List[Dict[str, str]]]:
 
 
 def summary_text(s: Dict[str, Any]) -> str:
-    _p, name = s["folder"]
+    names = [name for _p, name in s["folders"]]
+    total = s["count"] * len(names)
     return "\n".join([
         "<b>📋 Заказ</b>",
-        f"📁 Папка (хук): <b>{name}</b>",
-        f"🔢 Кол-во видео: <b>{s['count']}</b>",
+        f"📁 Папки (хуки): <b>{', '.join(names)}</b>",
+        f"🔢 Видео на папку: <b>{s['count']}</b>  (всего {total})",
         f"🗑 Удаление из folder_2-5: <b>{'да' if s['delete'] else 'нет'}</b>",
         f"🎲 Рандом видео из папок 2-5: <b>{'да' if s['rand_body'] else 'по порядку'}</b>",
-        f"🎣 Рандом хук из «{name}»: <b>{'да' if s['rand_hook'] else 'по порядку'}</b>",
+        f"🎣 Рандом хук из своей папки: <b>{'да' if s['rand_hook'] else 'по порядку'}</b>",
         f"⏱ Длительности: <b>{fmt_dur(s['durs'])}</b>",
+        "🧹 Метаданные: <b>очищаются полностью</b>",
+        "💎 Отправка: <b>документом, без сжатия</b>",
     ])
 
 
 # ======================================================================
 #  СБОРКА И ОТПРАВКА
 # ======================================================================
+
+def clean_metadata(path: str, ffmpeg_exe: str) -> bool:
+    """Полная очистка метаданных БЕЗ перекодирования (качество 1:1).
+
+    Убирает: глобальные теги, теги потоков, chapters, encoder-подписи
+    (bitexact), handler names. Remux copy → битрейт/качество не трогаются.
+    """
+    tmp = path + ".clean.mp4"
+    cmd = [
+        ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", path,
+        "-map", "0",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-fflags", "+bitexact",
+        "-flags:v", "+bitexact",
+        "-flags:a", "+bitexact",
+        "-metadata:s:v", "handler_name=",
+        "-metadata:s:a", "handler_name=",
+        "-movflags", "+faststart",
+        "-c", "copy",
+        tmp,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+            return True
+    except Exception:
+        pass
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    return False
+
 
 def load_render_config() -> Tuple[List[List[Dict[str, Any]]], Dict[str, Any], int]:
     """Пресеты текста по сегментам + экспорт из project.json."""
@@ -339,8 +392,10 @@ def load_render_config() -> Tuple[List[List[Dict[str, Any]]], Dict[str, Any], in
 
 
 def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
-    """Фоновый поток: собрать N видео и слать их в чат по мере готовности."""
-    folder_path, folder_name = s["folder"]
+    """Фоновый поток: для КАЖДОЙ выбранной папки собрать N видео,
+    и отправить их ПАЧКОЙ, когда вся папка готова (не по одному).
+    """
+    folders: List[Tuple[str, str]] = s["folders"]
     count: int = s["count"]
     delete: bool = s["delete"]
     rand_body: bool = s["rand_body"]
@@ -361,116 +416,137 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
 
         presets, exp, _n = load_render_config()
 
-        hooks = list_videos(folder_path)
-        if not hooks:
-            status(f"❌ В папке «{folder_name}» нет видео.\n"
-                   f"Закинь файлы в <code>folder_1/{folder_name}/</code>")
-            return
         pools = body_pools()
         empty = [FOLDERS[i + 1] for i, p in enumerate(pools) if not p]
         if empty:
             status("❌ Пустые папки тела ролика: " + ", ".join(empty))
             return
 
-        # при удалении максимум = самый маленький пул folder_2-5
-        limit = min(len(p) for p in pools)
-        real_count = count
-        note = ""
-        if delete and count > limit:
-            real_count = limit
-            note = (f"\n⚠️ С удалением хватает видео только на {limit} шт. "
-                    f"(меньше всего в самой маленькой папке)")
-
         res_w = int((exp.get("resolution") or {}).get("w", 1080) or 1080)
         res_h = int((exp.get("resolution") or {}).get("h", 1920) or 1920)
         fps = int(exp.get("fps", 30) or 30)
-        crf = int(exp.get("crf", 20) or 20)
-        preset = str(exp.get("preset", "fast") or "fast")
+        # 💎 наивысшее качество: CRF не хуже 16, медленный пресет
+        crf = min(int(exp.get("crf", 16) or 16), 16)
+        preset = "medium"
         with_audio = bool(exp.get("audio", True))
         uppercase = bool(exp.get("uppercase", False))
         ten_bit = bool(exp.get("ten_bit", False))
         blur_fill = bool(exp.get("blur_fill", False))
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        made, sent, errors = 0, 0, []
+        total_made, total_sent, errors = 0, 0, []
+        notes: List[str] = []
         t0 = time.time()
+        n_folders = len(folders)
 
         with build_lock:
-            for i in range(real_count):
-                status(f"🎬 Папка «{folder_name}»: собираю {i + 1}/{real_count}…"
-                       f"{note}")
-
-                # ---- хук: рандом или по порядку из ВЫБРАННОЙ подпапки ----
+            for fi, (folder_path, folder_name) in enumerate(folders, start=1):
+                hooks = list_videos(folder_path)
                 if not hooks:
-                    errors.append("хуки закончились")
-                    break
-                hook = (random.choice(hooks) if rand_hook
-                        else hooks[i % len(hooks)])
-
-                # ---- тело: folder_2-5 ----
-                vps = [hook]
-                used_body: List[str] = []
-                ok_pick = True
-                for pool in pools:
-                    if not pool:
-                        ok_pick = False
-                        break
-                    v = random.choice(pool) if rand_body else pool[i % len(pool)]
-                    vps.append(v)
-                    used_body.append(v)
-                if not ok_pick:
-                    errors.append("в одной из папок 2-5 кончились видео")
-                    break
-
-                out_name = f"{folder_name}_{i + 1:04d}.mp4"
-                out_path = os.path.join(OUTPUT_DIR, out_name)
-                k = 1
-                while os.path.exists(out_path):
-                    out_path = os.path.join(
-                        OUTPUT_DIR,
-                        f"{folder_name}_{i + 1:04d}_{k:03d}.mp4")
-                    k += 1
-
-                ok, err = build_one_final_ffmpeg(
-                    vps, presets, durs, out_path, ff,
-                    resolution=(res_w, res_h) if res_w and res_h else (1080, 1920),
-                    fps=fps, crf=crf, preset=preset,
-                    with_audio=with_audio, uppercase=uppercase,
-                    ten_bit=ten_bit, blur_fill=blur_fill,
-                    audio_kbps=192,
-                    random_flags=None, preset_indices=None)
-                if not ok:
-                    errors.append(f"#{i + 1}: {err[:120]}")
+                    errors.append(f"«{folder_name}»: нет видео в папке")
                     continue
-                made += 1
 
-                # ---- удаление использованных из folder_2-5 ----
-                if delete:
-                    for pi, v in enumerate(used_body):
-                        try:
-                            pools[pi].remove(v)
-                        except ValueError:
-                            pass
-                        try:
-                            os.remove(v)
-                        except Exception:
-                            pass
+                # при удалении максимум = самый маленький пул folder_2-5
+                limit = min(len(p) for p in pools) if pools else 0
+                real_count = count
+                if delete and count > limit:
+                    real_count = limit
+                    notes.append(f"«{folder_name}»: с удалением хватило "
+                                 f"только на {limit} шт.")
+                if real_count <= 0:
+                    errors.append(f"«{folder_name}»: в папках 2-5 "
+                                  "кончились видео")
+                    continue
 
-                # ---- отправка сразу в чат ----
-                tg.send_action(chat_id)
-                cap = (f"📁 {folder_name} • {made}/{real_count}\n"
-                       f"⏱ {fmt_dur(durs)}")
-                oks, info = tg.send_document(chat_id, out_path, cap)
-                if oks:
-                    sent += 1
-                else:
-                    errors.append(f"отправка #{i + 1}: {info}")
+                # ---------- 1) собираем ВСЕ видео этой папки ----------
+                ready: List[str] = []
+                for i in range(real_count):
+                    status(f"🎬 [{fi}/{n_folders}] Папка «{folder_name}»: "
+                           f"собираю {i + 1}/{real_count}…")
+
+                    hook = (random.choice(hooks) if rand_hook
+                            else hooks[i % len(hooks)])
+
+                    vps = [hook]
+                    used_body: List[str] = []
+                    ok_pick = True
+                    for pool in pools:
+                        if not pool:
+                            ok_pick = False
+                            break
+                        v = (random.choice(pool) if rand_body
+                             else pool[i % len(pool)])
+                        vps.append(v)
+                        used_body.append(v)
+                    if not ok_pick:
+                        errors.append(f"«{folder_name}»: в папках 2-5 "
+                                      "кончились видео")
+                        break
+
+                    out_name = f"{folder_name}_{i + 1:04d}.mp4"
+                    out_path = os.path.join(OUTPUT_DIR, out_name)
+                    k = 1
+                    while os.path.exists(out_path):
+                        out_path = os.path.join(
+                            OUTPUT_DIR,
+                            f"{folder_name}_{i + 1:04d}_{k:03d}.mp4")
+                        k += 1
+
+                    ok, err = build_one_final_ffmpeg(
+                        vps, presets, durs, out_path, ff,
+                        resolution=(res_w, res_h) if res_w and res_h
+                        else (1080, 1920),
+                        fps=fps, crf=crf, preset=preset,
+                        with_audio=with_audio, uppercase=uppercase,
+                        ten_bit=ten_bit, blur_fill=blur_fill,
+                        audio_kbps=256,
+                        random_flags=None, preset_indices=None)
+                    if not ok:
+                        errors.append(f"«{folder_name}» #{i + 1}: {err[:100]}")
+                        continue
+
+                    # ---- 🧹 полная очистка метаданных (без потери качества)
+                    clean_metadata(out_path, ff)
+                    ready.append(out_path)
+                    total_made += 1
+
+                    # ---- удаление использованных из folder_2-5 ----
+                    if delete:
+                        for pi, v in enumerate(used_body):
+                            try:
+                                pools[pi].remove(v)
+                            except ValueError:
+                                pass
+                            try:
+                                os.remove(v)
+                            except Exception:
+                                pass
+
+                # ---------- 2) папка готова → шлём ВСЮ пачку разом ----------
+                if ready:
+                    status(f"📤 [{fi}/{n_folders}] Папка «{folder_name}»: "
+                           f"отправляю {len(ready)} видео…")
+                    tg.send(chat_id,
+                            f"📁 <b>{folder_name}</b> готова — "
+                            f"{len(ready)} видео 👇")
+                    for k, fp in enumerate(ready, start=1):
+                        tg.send_action(chat_id)
+                        cap = (f"📁 {folder_name} • {k}/{len(ready)}\n"
+                               f"⏱ {fmt_dur(durs)} • 🧹 без метаданных")
+                        oks, info = tg.send_document(chat_id, fp, cap)
+                        if oks:
+                            total_sent += 1
+                        else:
+                            errors.append(f"отправка «{folder_name}» "
+                                          f"#{k}: {info}")
 
         dt = time.time() - t0
-        lines = [f"✅ Готово: собрано <b>{made}</b>, отправлено <b>{sent}</b> "
-                 f"из папки <b>{folder_name}</b> за {dt:.0f} сек."]
-        if note:
-            lines.append(note.strip())
+        names = ", ".join(n for _p, n in folders)
+        lines = [f"✅ Готово: собрано <b>{total_made}</b>, отправлено "
+                 f"<b>{total_sent}</b> из папок <b>{names}</b> "
+                 f"за {dt:.0f} сек."]
+        if notes:
+            lines.append("⚠️ " + "\n⚠️ ".join(notes[:3]))
         if errors:
             lines.append("⚠️ Ошибки:\n" + "\n".join("• " + e for e in errors[:5]))
         status("\n".join(lines))
@@ -479,8 +555,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
         status(f"❌ Ошибка: {e}")
     finally:
         busy_chats.discard(chat_id)
-        reset_session(chat_id)
-        tg.send(chat_id, main_menu_text(), kb_main())
+        show_main_menu(tg, chat_id)
 
 
 # ======================================================================
@@ -488,8 +563,19 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
 # ======================================================================
 
 def show_main_menu(tg: Tg, chat_id: int) -> None:
-    reset_session(chat_id)
-    tg.send(chat_id, main_menu_text(), kb_main())
+    s = reset_session(chat_id)
+    s["sel"] = set()
+    s["menu_id"] = tg.send(chat_id, main_menu_text(), kb_main())
+
+
+def refresh_menu(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
+    """Перерисовать меню выбора папок на месте (toggle галочек)."""
+    sel = s.get("sel") or set()
+    mid = s.get("menu_id")
+    if mid:
+        tg.edit(chat_id, mid, main_menu_text(sel), kb_main(sel))
+    else:
+        s["menu_id"] = tg.send(chat_id, main_menu_text(sel), kb_main(sel))
 
 
 def default_durations() -> List[float]:
@@ -629,29 +715,53 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         return
 
     if data.startswith("f:"):
-        tg.answer_cb(cb_id)
         try:
             idx = int(data.split(":")[1])
         except Exception:
+            tg.answer_cb(cb_id)
             return
         folders = user_folders()
         if idx < 0 or idx >= len(folders):
-            tg.send(chat_id, "❌ Папка не найдена, обнови меню.")
+            tg.answer_cb(cb_id, "Папка не найдена")
             show_main_menu(tg, chat_id)
             return
         path, name, n = folders[idx]
         if n == 0:
-            tg.send(chat_id,
-                    f"⚠️ В папке <b>{name}</b> нет видео.\n"
-                    f"Закинь файлы в <code>folder_1/{name}/</code> и обнови меню.")
+            tg.answer_cb(cb_id, f"В папке «{name}» нет видео!")
             return
+        # ---- toggle выбора ----
+        sel = s.setdefault("sel", set())
+        if name in sel:
+            sel.discard(name)
+            tg.answer_cb(cb_id, f"➖ {name}")
+        else:
+            sel.add(name)
+            tg.answer_cb(cb_id, f"✅ {name}")
+        refresh_menu(tg, chat_id, s)
+        return
+
+    if data == "next":
+        sel = s.get("sel") or set()
+        if not sel:
+            tg.answer_cb(cb_id, "Сначала выбери хотя бы одну папку")
+            return
+        tg.answer_cb(cb_id)
+        folders = [(p, nm) for p, nm, n in user_folders()
+                   if nm in sel and n > 0]
+        if not folders:
+            tg.answer_cb(cb_id, "В выбранных папках нет видео")
+            return
+        menu_id = s.get("menu_id")
         reset_session(chat_id)
         s = get_session(chat_id)
-        s["folder"] = (path, name)
+        s["folders"] = folders
+        s["menu_id"] = menu_id
         s["state"] = "count"
+        names = ", ".join(nm for _p, nm in folders)
         tg.send(chat_id,
-                f"📁 Папка <b>{name}</b> ({n} хуков).\n\n"
-                f"🔢 Сколько видео создать? Отправь число (1-{MAX_COUNT}):")
+                f"📁 Выбрано папок: <b>{len(folders)}</b> ({names}).\n\n"
+                f"🔢 Сколько видео создать <b>для каждой папки</b>? "
+                f"Отправь число (1-{MAX_COUNT}):")
         return
 
     if data.startswith("del:"):
@@ -673,12 +783,12 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
             return
         s["rand_body"] = data.endswith(":1")
         s["state"] = "wait_hook"
-        name = s["folder"][1] if s.get("folder") else "?"
+        names = ", ".join(nm for _p, nm in (s.get("folders") or []))
         tg.send(chat_id,
-                f"🎣 <b>Рандом хук?</b>\nВидео из выбранной папки «{name}» "
-                "(не из всех подпапок folder_1 — только из этой):",
+                f"🎣 <b>Рандом хук?</b>\nКаждое видео берёт хук только из "
+                f"СВОЕЙ папки ({names}), не из всех подпапок folder_1:",
                 kb_yes_no("hook",
-                          f"🎲 Рандомный хук из «{name}»",
+                          "🎲 Рандомный хук из своей папки",
                           "📑 Хуки по порядку"))
         return
 
