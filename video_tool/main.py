@@ -89,8 +89,20 @@ VIDEO_EXTS = {
 
 # Bright color map used by [blue]...[ /blue] tags and quick buttons
 COLOR_MAP: Dict[str, str] = {
-    "blue":   "#00D5FF",
-    "cyan":   "#00E5FF",
+    # ---- синие (насыщенные, много оттенков) ----
+    "blue":       "#0066FF",   # основной — сочный электрик, не бледный
+    "electric":   "#0047FF",   # электрик глубже
+    "royal":      "#2952FF",   # королевский
+    "neonblue":   "#1F51FF",   # неоновый
+    "deepblue":   "#0026FF",   # ультра-глубокий
+    "ultramarine": "#3B24FF",  # ультрамарин
+    "indigo":     "#4B0DFF",   # индиго
+    "navy":       "#0A2FA8",   # тёмно-синий
+    "azure":      "#007FFF",   # лазурный
+    "sky":        "#2EB8FF",   # небесный
+    "babyblue":   "#7FDBFF",   # светло-голубой
+    "cyan":       "#00E5FF",   # бирюзово-голубой (старый "blue" был похож на него)
+    # ---- остальные ----
     "red":    "#FF4D6D",
     "yellow": "#FFD54F",
     "green":  "#4DFF8C",
@@ -2811,6 +2823,23 @@ class SegmentCard(QFrame):
             crow.addWidget(b)
         crow.addStretch(1)
         edl.addLayout(crow)
+
+        # ---- вторая строка: оттенки синего ----
+        blues = ["electric", "royal", "neonblue", "deepblue",
+                 "ultramarine", "indigo", "navy", "azure", "sky", "babyblue"]
+        brow = QHBoxLayout()
+        brow.setSpacing(5)
+        brow.addWidget(QLabel("Синие:"))
+        for name in blues:
+            b = QPushButton()
+            b.setObjectName("ColorBtn")
+            b.setStyleSheet(f"QPushButton#ColorBtn {{ background: {COLOR_MAP[name]}; }}")
+            b.setToolTip(f"[{name}]…[/{name}]  {COLOR_MAP[name]}")
+            b.clicked.connect(lambda _, n=name: self._insert_color(n))
+            self._color_btns.append(b)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        edl.addLayout(brow)
         root.addWidget(ed_frame)
 
         # ================= POSITION / SIZE =================
