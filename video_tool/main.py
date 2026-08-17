@@ -1133,13 +1133,18 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         # otherwise the container gets padded to the longer audio
         silent_dur = target_dur if is_first else min(orig_dur, target_dur)
 
+        # normalize audio for safe concat -c copy: constant 44.1k, async
+        # resample kills MOV/iPhone priming-sample drift, apad guarantees
+        # the track is at least as long as the video (then -t cuts exact)
+        A_NORM = "aresample=44100:async=1:first_pts=0,apad"
+
         if is_first and orig_dur > target_dur:
             # ---------- SPEED UP (first segment too long) ----------
             speed_factor = orig_dur / target_dur
             cmd += ["-i", input_video]
             vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{bg_chain}")
             if has_audio:
-                vf.append(f"[0:a]{build_atempo(speed_factor)}[a]")
+                vf.append(f"[0:a]{build_atempo(speed_factor)},{A_NORM}[a]")
                 audio_idx = 0
         elif is_first and orig_dur < target_dur:
             # ---------- LOOP (first segment too short) ----------
@@ -1147,7 +1152,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-stream_loop", str(loop), "-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
             trim_out = target_dur
         else:
@@ -1159,7 +1164,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
 
         # silent track when audio requested but source has none
@@ -1192,8 +1197,13 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         if audio_idx >= 0:
             cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k",
                     "-ar", "44100", "-ac", "2"]
-        if trim_out:
-            cmd += ["-t", f"{trim_out:.3f}"]
+        # -t is mandatory: apad makes the audio endless, and MOV sources
+        # often report audio slightly longer than video — cut both exactly
+        out_t = trim_out if trim_out else (target_dur if is_first
+                                           else min(orig_dur, target_dur))
+        cmd += ["-t", f"{out_t:.3f}"]
+        # identical timebase in every segment -> concat -c copy never breaks
+        cmd += ["-video_track_timescale", "90000"]
         cmd += ["-movflags", "+faststart", seg_out]
 
         if progress_cb:
@@ -1221,9 +1231,22 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
         with open(tmp_list, "w", encoding="utf-8") as f:
             for s in seg_files:
                 f.write("file '" + s.replace("\\", "/").replace("'", "'\\''") + "'\n")
+        # video: lossless stream copy. audio: cheap re-encode — AAC frames
+        # are 1024 samples, so each segment's audio is a hair longer than
+        # its video; pure -c copy then yields non-monotonic DTS (broken
+        # timestamps, players stutter — especially with MOV sources).
+        # aresample=async=1 re-times audio into one continuous track.
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-fflags", "+genpts",
                "-f", "concat", "-safe", "0", "-i", tmp_list,
-               "-c", "copy", out_path]
+               "-c:v", "copy"]
+        if with_audio:
+            cmd += ["-af", "aresample=44100:async=1:first_pts=0",
+                    "-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2",
+                    "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-movflags", "+faststart", out_path]
         r = subprocess.run(cmd, capture_output=True, timeout=600)
         if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
             return True, ""
