@@ -610,6 +610,35 @@ def _probe(path: str, ffmpeg_exe: str) -> Dict[str, Any]:
         pm = re.search(r"Video:.*?(yuv\d+p\d+le|p010le|p210le|p016le|yuv444p12le)", txt)
         info["pix_fmt"] = pm.group(1) if pm else ""
         info["ten_bit"] = bool(pm)
+        # ---- color info: range + primaries/transfer/matrix ----
+        # examples:  yuv420p(tv, bt709, progressive)
+        #            yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)
+        #            yuvj420p(pc, progressive)
+        info["color_range"] = ""
+        info["color_trc"] = ""
+        info["color_primaries"] = ""
+        # match the parens right after the pixel format token:
+        #   ", yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)"
+        cm = re.search(r"Video:[^\n]*?,\s*[a-z0-9]+le?\(([^)]*)\)", txt)
+        if not cm:
+            cm = re.search(r"Video:[^\n]*?,\s*yuvj?\d+p[\da-z]*\(([^)]*)\)", txt)
+        if cm:
+            inner = cm.group(1)
+            parts = [p.strip() for p in inner.split(",")]
+            for p in parts:
+                if p in ("tv", "pc"):
+                    info["color_range"] = p
+                elif "/" in p:                       # matrix/primaries/transfer
+                    bits = p.split("/")
+                    if len(bits) >= 3:
+                        info["color_primaries"] = bits[1].strip()
+                        info["color_trc"] = bits[2].strip()
+                elif p.startswith("bt") or "smpte" in p or "arib" in p:
+                    info["color_primaries"] = p
+        info["hdr"] = (
+            info["color_trc"] in ("smpte2084", "arib-std-b67")
+            or "bt2020" in info["color_primaries"]
+        )
     except Exception:
         pass
     return info
@@ -1071,24 +1100,28 @@ def build_atempo(factor: float) -> str:
 
 
 def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
-                   blur_fill: bool = False) -> str:
+                   blur_fill: bool = False, prefix: str = "") -> str:
     """Background filter chain ending with the [bg] output label.
 
     Normal: scale+center-crop. blur_fill: full-frame blurred copy behind the
     centered original (no content lost for non-vertical sources).
+    prefix: optional color-normalization filters inserted before scaling
+    (HDR tonemap / full-range fix for MOV sources).
     """
     if not blur_fill:
         return (
+            f"{prefix}"
             f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-            f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
+            f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
         )
     return (
+        f"{prefix}"
         f"split[bgA][fgA];"
         f"[bgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-        f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,"
+        f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,"
         f"boxblur=20:5,eq=brightness=-0.12,fps={fps}[blur];"
         f"[fgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:"
-        f"flags=lanczos[fgvid];"
+        f"flags=bicubic[fgvid];"
         f"[blur][fgvid]overlay=(W-w)/2:(H-h)/2[bg]"
     )
 
@@ -1112,16 +1145,40 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         orig_dur = max(0.05, float(orig_dur or target_dur))
         has_audio = with_audio and video_has_audio(input_video, ffmpeg_exe)
 
+        # probe source color info (HDR / full-range MOVs from iPhone etc.)
+        src_info: Dict[str, Any] = {}
+        try:
+            src_info = _probe(input_video, ffmpeg_exe)
+        except Exception:
+            src_info = {}
+
         # decide output pixel format (10-bit only when source is 10-bit)
         use10 = False
         if ten_bit:
-            try:
-                use10 = bool(_probe(input_video, ffmpeg_exe).get("ten_bit"))
-            except Exception:
-                use10 = False
+            use10 = bool(src_info.get("ten_bit"))
         pix = "yuv420p10le" if use10 else "yuv420p"
 
-        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        # ---- color normalization prefix for MOV/iPhone sources ----
+        # HDR (HLG/PQ/bt2020): proper tonemap to SDR bt709 — otherwise the
+        # colors get oversaturated / oversharpened-looking after a naive
+        # matrix reinterpretation.
+        # Full-range (pc/yuvj420p): explicit pc->tv conversion — otherwise
+        # contrast gets crushed/boosted ("повышенная резкость" look).
+        color_fix = ""
+        if src_info.get("hdr"):
+            color_fix = (
+                "zscale=t=linear:npl=100,format=gbrpf32le,"
+                "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+            )
+        elif src_info.get("color_range") == "pc":
+            color_fix = (
+                "scale=in_range=pc:out_range=tv,"
+                "setparams=range=tv:colorspace=bt709,"
+            )
+
+        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill,
+                                  prefix=color_fix)
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
