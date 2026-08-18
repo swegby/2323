@@ -365,6 +365,9 @@ def summary_text(s: Dict[str, Any]) -> str:
                      "(не ускоряется/не режется)")
     else:
         hook_line = "🎬 Хук без изменений: <b>нет, подгоняется под длительность</b>"
+    uniq_line = ("🧬 Микро-уник папок 2-5: <b>да (невидимый рандом)</b>"
+                 if s.get("micro_uniq")
+                 else "🧬 Микро-уник папок 2-5: <b>нет</b>")
     return "\n".join([
         "<b>📋 Заказ</b>",
         f"📁 Папки (хуки): <b>{', '.join(names)}</b>",
@@ -373,6 +376,7 @@ def summary_text(s: Dict[str, Any]) -> str:
         f"🎲 Рандом видео из папок 2-5: <b>{'да' if s['rand_body'] else 'по порядку'}</b>",
         f"🎣 Рандом хук из своей папки: <b>{'да' if s['rand_hook'] else 'по порядку'}</b>",
         hook_line,
+        uniq_line,
         f"⏱ Длительности: <b>{fmt_dur(s['durs'])}</b>",
         "🧹 Метаданные: <b>очищаются полностью</b>",
         "💎 Отправка: <b>документом, без сжатия</b>",
@@ -444,6 +448,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     rand_hook: bool = s["rand_hook"]
     keep_hook: bool = bool(s.get("keep_hook"))
     keep_hook_max: float = float(s.get("keep_hook_max", 3.5) or 3.5)
+    micro_uniq: bool = bool(s.get("micro_uniq"))
     durs: List[float] = s["durs"]
 
     status_id = tg.send(chat_id, "⏳ Готовлюсь к сборке…")
@@ -553,7 +558,8 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                         with_audio=with_audio, uppercase=uppercase,
                         ten_bit=ten_bit, blur_fill=blur_fill,
                         audio_kbps=256,
-                        random_flags=None, preset_indices=None)
+                        random_flags=None, preset_indices=None,
+                        micro_uniq=micro_uniq)
                     if not ok:
                         errors.append(f"«{folder_name}» #{i + 1}: {err[:100]}")
                         continue
@@ -584,8 +590,9 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                             f"{len(ready)} видео 👇")
                     for k, (fp, fdurs) in enumerate(ready, start=1):
                         tg.send_action(chat_id)
+                        u = " • 🧬 уник" if micro_uniq else ""
                         cap = (f"📁 {folder_name} • {k}/{len(ready)}\n"
-                               f"⏱ {fmt_dur(fdurs)} • 🧹 без метаданных")
+                               f"⏱ {fmt_dur(fdurs)} • 🧹 без метаданных{u}")
                         oks, info = tg.send_document(chat_id, fp, cap)
                         if oks:
                             total_sent += 1
@@ -720,6 +727,19 @@ def save_incoming_video(tg: Tg, chat_id: int, s: Dict[str, Any],
                      "Кидай ещё или жми «✅ Готово».")
 
 
+def ask_uniq(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
+    s["state"] = "wait_uniq"
+    tg.send(chat_id,
+            "🧬 <b>Микро-уник папок 2-5?</b>\n"
+            "Каждое видео получает невидимый глазу рандом: сдвиг пикселей "
+            "меньше 0.5%, микро-яркость/контраст/оттенок, лёгкое зерно. "
+            "Хэш и цифровой отпечаток у каждого ролика будут разными — "
+            "для Instagram/TikTok это уникальный контент:",
+            kb_yes_no("uniq",
+                      "🧬 Да, уникализировать (сегменты 2-5)",
+                      "📄 Нет, без уника"))
+
+
 def ask_durations(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     s["state"] = "durations"
     dd = default_durations()
@@ -804,7 +824,7 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
             tg.send(chat_id, "❌ От 0.001 до 600 секунд.")
             return
         s["keep_hook_max"] = lim
-        ask_durations(tg, chat_id, s)
+        ask_uniq(tg, chat_id, s)
         return
 
     if state == "count":
@@ -1035,7 +1055,7 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
                     kb)
         else:
             s["keep_hook"] = False
-            ask_durations(tg, chat_id, s)
+            ask_uniq(tg, chat_id, s)
         return
 
     if data.startswith("keeplim:"):
@@ -1046,6 +1066,14 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
             s["keep_hook_max"] = float(data.split(":")[1])
         except Exception:
             s["keep_hook_max"] = 3.5
+        ask_uniq(tg, chat_id, s)
+        return
+
+    if data.startswith("uniq:"):
+        tg.answer_cb(cb_id)
+        if s.get("state") != "wait_uniq":
+            return
+        s["micro_uniq"] = data.endswith(":1")
         ask_durations(tg, chat_id, s)
         return
 

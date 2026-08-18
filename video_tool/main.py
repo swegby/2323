@@ -1126,6 +1126,32 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
     )
 
 
+def _micro_uniq_chain(canvas_w: int, canvas_h: int) -> str:
+    """Invisible-to-the-eye uniquification filters (fresh random each call).
+
+    Changes the pixel data (hence hash/fingerprint) without visible impact:
+      • sub-pixel shift: upscale + crop with a random 1-6 px offset
+      • micro eq: brightness ±0.004, contrast/saturation ±0.008
+      • micro hue rotation ±0.4°
+      • faint film grain (strength 1) with a random seed
+    """
+    pad = 6                                  # work area for the shift crop
+    dx = random.randint(0, 4)
+    dy = random.randint(0, 4)
+    br = random.uniform(-0.004, 0.004)
+    ct = random.uniform(0.992, 1.008)
+    sat = random.uniform(0.992, 1.008)
+    hue = random.uniform(-0.4, 0.4)
+    seed = random.randint(0, 2 ** 31 - 1)
+    return (
+        f"scale={canvas_w + pad}:{canvas_h + pad}:flags=bicubic,"
+        f"crop={canvas_w}:{canvas_h}:{dx}:{dy},"
+        f"eq=brightness={br:.5f}:contrast={ct:.5f}:saturation={sat:.5f},"
+        f"hue=h={hue:.3f},"
+        f"noise=alls=1:allf=t:all_seed={seed},"
+    )
+
+
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          target_dur: float, is_first: bool, orig_dur: float,
                          seg_out: str, ffmpeg_exe: str, crf: int = 18,
@@ -1133,12 +1159,14 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          with_audio: bool = True,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
-                         audio_kbps: int = 192,
+                         audio_kbps: int = 192, micro_uniq: bool = False,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
     ten_bit  — keep 10-bit depth when the source is 10-bit (no banding).
     blur_fill— blurred background fill instead of hard crop for wrong aspect.
+    micro_uniq — invisible pixel-level uniquification (random sub-pixel
+    shift + micro color/grain) so every output has a different fingerprint.
     """
     try:
         target_dur = max(0.3, float(target_dur))
@@ -1239,7 +1267,8 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         fmt = f"format={pix}" + (":" + cs_opt if cs_opt else "")
         # text PNG is FULL canvas with the text already drawn at its absolute
         # position -> overlay at 0:0 (any other offset would shift it off-screen)
-        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{fmt}[v]")
+        uniq = _micro_uniq_chain(canvas_w, canvas_h) if micro_uniq else ""
+        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{uniq}{fmt}[v]")
 
         cmd += ["-filter_complex", ";".join(vf)]
         cmd += ["-map", "[v]"]
@@ -1361,11 +1390,15 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            audio_kbps: int = 192,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
+                           micro_uniq: bool = False,
                            progress_cb=None) -> Tuple[bool, str]:
     """Full pipeline: render 5 segments in parallel, concat, cleanup.
 
     random_flags[i]=False -> use segment i's CURRENT preset (the one shown
     in the preview) instead of a random one.
+    micro_uniq=True -> segments 2-5 (folder_2..folder_5 material) get an
+    invisible random pixel-level uniquification, so every build has a
+    different hash/fingerprint even from the same source files.
     """
     canvas_w, canvas_h = resolution
     temp = os.path.join(OUTPUT_DIR, f"_temp_{uuid.uuid4().hex[:8]}")
@@ -1404,6 +1437,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                micro_uniq=(micro_uniq and i >= 1),
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
