@@ -33,6 +33,7 @@ import sys
 import json
 import time
 import random
+import re
 import subprocess
 import threading
 import traceback
@@ -96,7 +97,7 @@ from main import (
     ensure_dirs, natural_key, list_videos,
     load_project, load_characters, save_characters,
     get_ffmpeg_exe, is_valid_ffmpeg, get_video_duration,
-    build_one_final_ffmpeg, download_fonts,
+    build_one_final_ffmpeg, build_segment_ffmpeg, download_fonts,
     FONT_ANTON, FONT_OSWALD,
 )
 
@@ -359,6 +360,19 @@ def kb_yes_no(prefix: str, yes: str, no: str) -> List[List[Dict[str, str]]]:
 def summary_text(s: Dict[str, Any]) -> str:
     names = [name for _p, name in s["folders"]]
     total = s["count"] * len(names)
+    if s.get("hooks_only"):
+        uniq_line = ("🧬 Микро-уник: <b>да (невидимый рандом)</b>"
+                     if s.get("micro_uniq") else "🧬 Микро-уник: <b>нет</b>")
+        return "\n".join([
+            "<b>📋 Заказ — только хуки</b>",
+            f"📁 Папки: <b>{', '.join(names)}</b>",
+            f"🔢 Хуков на папку: <b>{s['count']}</b>  (всего {total})",
+            f"🎣 Выбор хуков: <b>{'рандом' if s['rand_hook'] else 'по порядку'}</b>",
+            "✂️ Без надписей, без склейки с папками 2-5, хук целиком",
+            uniq_line,
+            "🧹 Метаданные: <b>очищаются полностью</b>",
+            "💎 Отправка: <b>документом, без сжатия</b>",
+        ])
     if s.get("keep_hook"):
         hook_line = (f"🎬 Хук без изменений: <b>да, если ≤ "
                      f"{s.get('keep_hook_max', 3.5):.3f}с</b> "
@@ -386,6 +400,61 @@ def summary_text(s: Dict[str, Any]) -> str:
 # ======================================================================
 #  СБОРКА И ОТПРАВКА
 # ======================================================================
+
+def process_hook_only(src: str, out_path: str, ffmpeg_exe: str,
+                      micro_uniq: bool) -> Tuple[bool, str]:
+    """«Только хуки»: видео целиком, без надписей и склейки.
+
+    Без уника — remux copy в mp4 (качество 1:1). С уником — один
+    качественный перекод (CRF 16) с невидимым рандомом.
+    """
+    try:
+        if micro_uniq:
+            from main import _probe, _micro_uniq_chain
+            info = _probe(src, ffmpeg_exe)
+            w = int(info.get("w") or 0) or 1080
+            h = int(info.get("h") or 0) or 1920
+            # чётные размеры для yuv420p
+            w -= w % 2
+            h -= h % 2
+            chain = _micro_uniq_chain(w, h).rstrip(",")
+            cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                   "-i", src, "-vf", chain,
+                   "-c:v", "libx264", "-preset", "medium", "-crf", "16",
+                   "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2",
+                   "-movflags", "+faststart", out_path]
+            r = subprocess.run(cmd, capture_output=True, timeout=1800)
+            if r.returncode == 0 and os.path.isfile(out_path) \
+                    and os.path.getsize(out_path) > 1024:
+                return True, ""
+            return False, r.stderr.decode("utf-8", "replace")[-300:]
+        # ---- без уника: remux без перекода видео (качество 1:1).
+        # аудио copy только если это AAC — иначе (PCM/ALAC из MOV)
+        # конвертим в AAC, чтобы mp4 играли все плееры/платформы.
+        aac_src = False
+        try:
+            pr = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", src],
+                                capture_output=True, text=True, timeout=30)
+            aac_src = bool(re.search(r"Audio:\s*aac\b", pr.stderr))
+        except Exception:
+            pass
+        cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+               "-c:v", "copy"]
+        if aac_src:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2"]
+        cmd += ["-movflags", "+faststart", out_path]
+        r = subprocess.run(cmd, capture_output=True, timeout=900)
+        if r.returncode == 0 and os.path.isfile(out_path) \
+                and os.path.getsize(out_path) > 1024:
+            return True, ""
+        return False, r.stderr.decode("utf-8", "replace")[-300:]
+    except Exception as e:
+        return False, str(e)
+
 
 def clean_metadata(path: str, ffmpeg_exe: str) -> bool:
     """Полная очистка метаданных БЕЗ перекодирования (качество 1:1).
@@ -449,6 +518,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     keep_hook: bool = bool(s.get("keep_hook"))
     keep_hook_max: float = float(s.get("keep_hook_max", 3.5) or 3.5)
     micro_uniq: bool = bool(s.get("micro_uniq"))
+    hooks_only: bool = bool(s.get("hooks_only"))
     durs: List[float] = s["durs"]
 
     status_id = tg.send(chat_id, "⏳ Готовлюсь к сборке…")
@@ -466,10 +536,11 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
         presets, exp, _n = load_render_config()
 
         pools = body_pools()
-        empty = [FOLDERS[i + 1] for i, p in enumerate(pools) if not p]
-        if empty:
-            status("❌ Пустые папки тела ролика: " + ", ".join(empty))
-            return
+        if not hooks_only:
+            empty = [FOLDERS[i + 1] for i, p in enumerate(pools) if not p]
+            if empty:
+                status("❌ Пустые папки тела ролика: " + ", ".join(empty))
+                return
 
         res_w = int((exp.get("resolution") or {}).get("w", 1080) or 1080)
         res_h = int((exp.get("resolution") or {}).get("h", 1920) or 1920)
@@ -493,6 +564,59 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                 hooks = list_videos(folder_path)
                 if not hooks:
                     errors.append(f"«{folder_name}»: нет видео в папке")
+                    continue
+
+                # ---------- 🎣 режим «только хуки» ----------
+                if hooks_only:
+                    real_count = min(count, len(hooks)) if not rand_hook \
+                        else count
+                    if real_count < count and not rand_hook:
+                        notes.append(f"«{folder_name}»: хуков в папке "
+                                     f"только {len(hooks)}")
+                    ready: List[Tuple[str, List[float]]] = []
+                    for i in range(real_count):
+                        status(f"🎣 [{fi}/{n_folders}] Папка "
+                               f"«{folder_name}»: обрабатываю "
+                               f"{i + 1}/{real_count}…")
+                        hook = (random.choice(hooks) if rand_hook
+                                else hooks[i % len(hooks)])
+                        out_path = os.path.join(
+                            OUTPUT_DIR, f"{folder_name}_hook_{i + 1:04d}.mp4")
+                        k = 1
+                        while os.path.exists(out_path):
+                            out_path = os.path.join(
+                                OUTPUT_DIR,
+                                f"{folder_name}_hook_{i + 1:04d}_{k:03d}.mp4")
+                            k += 1
+                        ok, err = process_hook_only(hook, out_path, ff,
+                                                    micro_uniq)
+                        if not ok:
+                            errors.append(f"«{folder_name}» #{i + 1}: "
+                                          f"{err[:100]}")
+                            continue
+                        clean_metadata(out_path, ff)
+                        hd = get_video_duration(out_path, ff)
+                        ready.append((out_path, [round(hd, 3)]))
+                        total_made += 1
+                    if ready:
+                        status(f"📤 [{fi}/{n_folders}] Папка "
+                               f"«{folder_name}»: отправляю "
+                               f"{len(ready)} хуков…")
+                        tg.send(chat_id,
+                                f"📁 <b>{folder_name}</b> готова — "
+                                f"{len(ready)} хуков 👇")
+                        for k, (fp, fdurs) in enumerate(ready, start=1):
+                            tg.send_action(chat_id)
+                            u = " • 🧬 уник" if micro_uniq else ""
+                            cap = (f"🎣 {folder_name} • {k}/{len(ready)}\n"
+                                   f"⏱ {fdurs[0]:.3f}с • чистый хук • "
+                                   f"🧹 без метаданных{u}")
+                            oks, info = tg.send_document(chat_id, fp, cap)
+                            if oks:
+                                total_sent += 1
+                            else:
+                                errors.append(f"отправка «{folder_name}» "
+                                              f"#{k}: {info}")
                     continue
 
                 # при удалении максимум = самый маленький пул folder_2-5
@@ -729,15 +853,19 @@ def save_incoming_video(tg: Tg, chat_id: int, s: Dict[str, Any],
 
 def ask_uniq(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     s["state"] = "wait_uniq"
+    if s.get("hooks_only"):
+        title = "🧬 <b>Микро-уник хуков?</b>"
+        yes = "🧬 Да, уникализировать хуки"
+    else:
+        title = "🧬 <b>Микро-уник папок 2-5?</b>"
+        yes = "🧬 Да, уникализировать (сегменты 2-5)"
     tg.send(chat_id,
-            "🧬 <b>Микро-уник папок 2-5?</b>\n"
+            f"{title}\n"
             "Каждое видео получает невидимый глазу рандом: сдвиг пикселей "
             "меньше 0.5%, микро-яркость/контраст/оттенок, лёгкое зерно. "
             "Хэш и цифровой отпечаток у каждого ролика будут разными — "
             "для Instagram/TikTok это уникальный контент:",
-            kb_yes_no("uniq",
-                      "🧬 Да, уникализировать (сегменты 2-5)",
-                      "📄 Нет, без уника"))
+            kb_yes_no("uniq", yes, "📄 Нет, без уника"))
 
 
 def ask_durations(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
@@ -837,6 +965,17 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
             tg.send(chat_id, f"❌ От 1 до {MAX_COUNT}.")
             return
         s["count"] = n
+        if s.get("hooks_only"):
+            # только хуки: папки 2-5 не участвуют — сразу к выбору хука
+            s["delete"] = False
+            s["rand_body"] = False
+            s["state"] = "wait_hook"
+            tg.send(chat_id,
+                    "🎣 <b>Как брать хуки из папки?</b>",
+                    kb_yes_no("hook",
+                              "🎲 Рандомные хуки",
+                              "📑 По порядку"))
+            return
         s["state"] = "wait_delete"
         tg.send(chat_id,
                 "🗑 <b>Режим использования папок 2-5</b>",
@@ -986,11 +1125,32 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         s = get_session(chat_id)
         s["folders"] = folders
         s["menu_id"] = menu_id
-        s["state"] = "count"
+        s["state"] = "wait_mode"
         names = ", ".join(nm for _p, nm in folders)
+        kb = [[{"text": "🎬 Полное видео (хук + папки 2-5)",
+                "callback_data": "mode:full"}],
+              [{"text": "🎣 Только хуки (без надписей и склейки)",
+                "callback_data": "mode:hooks"}],
+              [{"text": "❌ Отмена", "callback_data": "cancel"}]]
         tg.send(chat_id,
                 f"📁 Выбрано папок: <b>{len(folders)}</b> ({names}).\n\n"
-                f"🔢 Сколько видео создать <b>для каждой папки</b>? "
+                "⚙️ <b>Что делаем?</b>\n"
+                "• Полное видео — как обычно: хук + сегменты из папок 2-5 "
+                "с надписями.\n"
+                "• Только хуки — чистые видео из выбранных папок: без "
+                "надписей, без папок 2-5, только обработка "
+                "(формат/уник/очистка метаданных).", kb)
+        return
+
+    if data.startswith("mode:"):
+        tg.answer_cb(cb_id)
+        if s.get("state") != "wait_mode":
+            return
+        s["hooks_only"] = data.endswith(":hooks")
+        s["state"] = "count"
+        what = "хуков" if s["hooks_only"] else "видео"
+        tg.send(chat_id,
+                f"🔢 Сколько {what} создать <b>для каждой папки</b>? "
                 f"Отправь число (1-{MAX_COUNT}):")
         return
 
@@ -1027,6 +1187,11 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_hook":
             return
         s["rand_hook"] = data.endswith(":1")
+        if s.get("hooks_only"):
+            # только хуки: они всегда идут как есть — сразу к унику
+            s["keep_hook"] = False
+            ask_uniq(tg, chat_id, s)
+            return
         s["state"] = "wait_keep"
         tg.send(chat_id,
                 "🎬 <b>Хук без изменений?</b>\n"
@@ -1074,6 +1239,11 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_uniq":
             return
         s["micro_uniq"] = data.endswith(":1")
+        if s.get("hooks_only"):
+            # только хуки: длительности не нужны — хук идёт целиком
+            s["durs"] = default_durations()
+            show_summary(tg, chat_id, s)
+            return
         ask_durations(tg, chat_id, s)
         return
 
