@@ -360,6 +360,24 @@ def kb_yes_no(prefix: str, yes: str, no: str) -> List[List[Dict[str, str]]]:
 def summary_text(s: Dict[str, Any]) -> str:
     names = [name for _p, name in s["folders"]]
     total = s["count"] * len(names)
+    if s.get("parts_mode"):
+        uniq_line = ("🧬 Микро-уник: <b>да (невидимый рандом)</b>"
+                     if s.get("micro_uniq") else "🧬 Микро-уник: <b>нет</b>")
+        n = s["count"]
+        total_files = n * (len(names) + len(FOLDER_DIRS) - 1)
+        return "\n".join([
+            "<b>📋 Заказ — фрагменты по отдельности</b>",
+            f"📁 Папки хуков: <b>{', '.join(names)}</b>",
+            f"🔢 По <b>{n}</b> каждого типа: {n} хуков из каждой папки + "
+            f"по {n} видео из папок 2-5  (всего {total_files} файлов)",
+            "🎲 Хуки и видео: <b>всегда рандом</b>",
+            f"🗑 Удаление отправленных из folder_2-5: "
+            f"<b>{'да' if s['delete'] else 'нет'}</b>",
+            "✂️ Без надписей, каждый фрагмент отдельным файлом",
+            uniq_line,
+            "🧹 Метаданные: <b>очищаются полностью</b>",
+            "💎 Отправка: <b>документом, без сжатия</b>",
+        ])
     if s.get("hooks_only"):
         uniq_line = ("🧬 Микро-уник: <b>да (невидимый рандом)</b>"
                      if s.get("micro_uniq") else "🧬 Микро-уник: <b>нет</b>")
@@ -519,6 +537,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     keep_hook_max: float = float(s.get("keep_hook_max", 3.5) or 3.5)
     micro_uniq: bool = bool(s.get("micro_uniq"))
     hooks_only: bool = bool(s.get("hooks_only"))
+    parts_mode: bool = bool(s.get("parts_mode"))
     durs: List[float] = s["durs"]
 
     status_id = tg.send(chat_id, "⏳ Готовлюсь к сборке…")
@@ -536,7 +555,7 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
         presets, exp, _n = load_render_config()
 
         pools = body_pools()
-        if not hooks_only:
+        if not hooks_only and not parts_mode:
             empty = [FOLDERS[i + 1] for i, p in enumerate(pools) if not p]
             if empty:
                 status("❌ Пустые папки тела ролика: " + ", ".join(empty))
@@ -558,6 +577,96 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
         notes: List[str] = []
         t0 = time.time()
         n_folders = len(folders)
+
+        # ================= 🧩 режим «фрагменты по отдельности» =========
+        if parts_mode:
+            def send_batch(src_list: List[str], label: str,
+                           tag: str, delete_after: bool,
+                           pool_ref: Optional[List[str]] = None) -> None:
+                nonlocal total_made, total_sent
+                if not src_list:
+                    return
+                sent_files: List[Tuple[str, float]] = []
+                for i, src in enumerate(src_list, start=1):
+                    status(f"🧩 {label}: обрабатываю {i}/{len(src_list)}…")
+                    out_path = os.path.join(
+                        OUTPUT_DIR, f"{tag}_{i:04d}.mp4")
+                    k = 1
+                    while os.path.exists(out_path):
+                        out_path = os.path.join(
+                            OUTPUT_DIR, f"{tag}_{i:04d}_{k:03d}.mp4")
+                        k += 1
+                    ok, err = process_hook_only(src, out_path, ff,
+                                                micro_uniq)
+                    if not ok:
+                        errors.append(f"{label} #{i}: {err[:100]}")
+                        continue
+                    clean_metadata(out_path, ff)
+                    hd = get_video_duration(out_path, ff)
+                    sent_files.append((out_path, hd))
+                    total_made += 1
+                    if delete_after:
+                        try:
+                            os.remove(src)
+                        except Exception:
+                            pass
+                        if pool_ref is not None:
+                            try:
+                                pool_ref.remove(src)
+                            except ValueError:
+                                pass
+                if sent_files:
+                    status(f"📤 {label}: отправляю {len(sent_files)}…")
+                    tg.send(chat_id, f"📦 <b>{label}</b> — "
+                                     f"{len(sent_files)} файлов 👇")
+                    for k, (fp, hd) in enumerate(sent_files, start=1):
+                        tg.send_action(chat_id)
+                        u = " • 🧬 уник" if micro_uniq else ""
+                        cap = (f"🧩 {label} • {k}/{len(sent_files)}\n"
+                               f"⏱ {hd:.3f}с • 🧹 без метаданных{u}")
+                        oks, info = tg.send_document(chat_id, fp, cap)
+                        if oks:
+                            total_sent += 1
+                        else:
+                            errors.append(f"отправка {label} #{k}: {info}")
+
+            with build_lock:
+                # --- хуки: по count из КАЖДОЙ выбранной папки, рандом ---
+                for folder_path, folder_name in folders:
+                    hooks = list_videos(folder_path)
+                    if not hooks:
+                        errors.append(f"«{folder_name}»: нет видео")
+                        continue
+                    n = min(count, len(hooks))
+                    if n < count:
+                        notes.append(f"хуков «{folder_name}» только {n}")
+                    picks = random.sample(hooks, n)
+                    send_batch(picks, f"Хуки «{folder_name}»",
+                               f"{folder_name}_hook", False)
+                # --- папки 2-5: по count из каждой, рандом ---
+                for pi, pool in enumerate(pools):
+                    fname = FOLDERS[pi + 1]
+                    if not pool:
+                        errors.append(f"{fname}: пусто")
+                        continue
+                    n = min(count, len(pool))
+                    if n < count:
+                        notes.append(f"в {fname} только {n}")
+                    picks = random.sample(pool, n)
+                    send_batch(picks, f"Папка {pi + 2} ({fname})",
+                               f"{fname}", delete, pool_ref=pool)
+
+            dt = time.time() - t0
+            lines = [f"✅ Готово: обработано <b>{total_made}</b>, "
+                     f"отправлено <b>{total_sent}</b> фрагментов "
+                     f"за {dt:.0f} сек."]
+            if notes:
+                lines.append("⚠️ " + "\n⚠️ ".join(notes[:4]))
+            if errors:
+                lines.append("⚠️ Ошибки:\n"
+                             + "\n".join("• " + e for e in errors[:5]))
+            status("\n".join(lines))
+            return
 
         with build_lock:
             for fi, (folder_path, folder_name) in enumerate(folders, start=1):
@@ -856,6 +965,9 @@ def ask_uniq(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     if s.get("hooks_only"):
         title = "🧬 <b>Микро-уник хуков?</b>"
         yes = "🧬 Да, уникализировать хуки"
+    elif s.get("parts_mode"):
+        title = "🧬 <b>Микро-уник фрагментов?</b>"
+        yes = "🧬 Да, уникализировать все фрагменты"
     else:
         title = "🧬 <b>Микро-уник папок 2-5?</b>"
         yes = "🧬 Да, уникализировать (сегменты 2-5)"
@@ -975,6 +1087,18 @@ def handle_message(tg: Tg, msg: Dict[str, Any]) -> None:
                     kb_yes_no("hook",
                               "🎲 Рандомные хуки",
                               "📑 По порядку"))
+            return
+        if s.get("parts_mode"):
+            # фрагменты: хук и видео всегда рандом — только вопрос удаления
+            s["rand_hook"] = True
+            s["rand_body"] = True
+            s["keep_hook"] = False
+            s["state"] = "wait_delete"
+            tg.send(chat_id,
+                    "🗑 <b>Удалять использованные видео из папок 2-5?</b>",
+                    kb_yes_no("del",
+                              "🗑 Да, удалять отправленные",
+                              "📌 Нет, оставлять"))
             return
         s["state"] = "wait_delete"
         tg.send(chat_id,
@@ -1131,6 +1255,8 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
                 "callback_data": "mode:full"}],
               [{"text": "🎣 Только хуки (без надписей и склейки)",
                 "callback_data": "mode:hooks"}],
+              [{"text": "🧩 Фрагменты по отдельности (хуки + папки 2-5)",
+                "callback_data": "mode:parts"}],
               [{"text": "❌ Отмена", "callback_data": "cancel"}]]
         tg.send(chat_id,
                 f"📁 Выбрано папок: <b>{len(folders)}</b> ({names}).\n\n"
@@ -1138,8 +1264,10 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
                 "• Полное видео — как обычно: хук + сегменты из папок 2-5 "
                 "с надписями.\n"
                 "• Только хуки — чистые видео из выбранных папок: без "
-                "надписей, без папок 2-5, только обработка "
-                "(формат/уник/очистка метаданных).", kb)
+                "надписей, без папок 2-5.\n"
+                "• Фрагменты — всё по отдельности файлами: N хуков без "
+                "надписей + N видео из каждой папки 2-5 (хук и видео "
+                "всегда рандом).", kb)
         return
 
     if data.startswith("mode:"):
@@ -1147,7 +1275,14 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_mode":
             return
         s["hooks_only"] = data.endswith(":hooks")
+        s["parts_mode"] = data.endswith(":parts")
         s["state"] = "count"
+        if s["parts_mode"]:
+            tg.send(chat_id,
+                    "🔢 <b>Сколько файлов каждого типа?</b>\n"
+                    "Например 3 = 3 хука + по 3 видео из папок 2, 3, 4, 5.\n"
+                    f"Отправь число (1-{MAX_COUNT}):")
+            return
         what = "хуков" if s["hooks_only"] else "видео"
         tg.send(chat_id,
                 f"🔢 Сколько {what} создать <b>для каждой папки</b>? "
@@ -1159,6 +1294,10 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_delete":
             return
         s["delete"] = data.endswith(":1")
+        if s.get("parts_mode"):
+            # фрагменты: рандом всегда — сразу к унику
+            ask_uniq(tg, chat_id, s)
+            return
         s["state"] = "wait_body"
         tg.send(chat_id,
                 "🎲 <b>Как брать видео из папок 2-5?</b>",
@@ -1239,8 +1378,8 @@ def handle_callback(tg: Tg, cb: Dict[str, Any]) -> None:
         if s.get("state") != "wait_uniq":
             return
         s["micro_uniq"] = data.endswith(":1")
-        if s.get("hooks_only"):
-            # только хуки: длительности не нужны — хук идёт целиком
+        if s.get("hooks_only") or s.get("parts_mode"):
+            # хуки/фрагменты идут целиком — длительности не нужны
             s["durs"] = default_durations()
             show_summary(tg, chat_id, s)
             return
