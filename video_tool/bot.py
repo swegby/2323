@@ -167,9 +167,12 @@ class Tg:
         url = API.format(token=self.token, method="sendDocument")
         try:
             with open(file_path, "rb") as f:
+                # application/octet-stream => Telegram шлёт ИМЕННО файлом
+                # (с video/mp4 клиенты показывают его как видео с плеером)
                 files = {"document": (os.path.basename(file_path), f,
-                                      "video/mp4")}
+                                      "application/octet-stream")}
                 data = {"chat_id": chat_id, "caption": caption,
+                        "disable_content_type_detection": True,
                         "disable_notification": True}
                 r = requests.post(url, data=data, files=files, timeout=600)
             if r.ok and r.json().get("ok"):
