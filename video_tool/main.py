@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.8"
+APP_VERSION = "v2.9"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -161,6 +161,10 @@ RESOLUTIONS = [
 
 FPS_CHOICES = [30, 24, 60]
 
+# Auto batch size multiplier when micro-crop uniquification (2-5) is ON:
+# reuse of the same source files is then safe and intended.
+UNIQUE_AUTO_MULT = 10
+
 # ======================================================================
 #  FILE SYSTEM HELPERS
 # ======================================================================
@@ -231,6 +235,36 @@ def open_folder(path: str) -> None:
             subprocess.Popen(["xdg-open", path])
     except Exception:
         pass
+
+
+def plan_batch(char_folders: List[Tuple[str, str, int]],
+               others: List[List[str]], mode: int, count: int,
+               unique: bool, unique_2_5: bool) -> Tuple[int, int, bool]:
+    """Decide how many videos a batch produces, and whether sources are reused.
+
+    natural   — one video per hook (every source used once).
+    count > 0 — exactly that many videos; hooks and 2-5 are cycled/reused.
+    Auto (0)  — natural, or natural×UNIQUE_AUTO_MULT when micro-crop
+                uniquification (2-5) is ON, since reuse is then safe and intended.
+    unique    — "без повторов 2-5": caps the batch so each 2-5 file is used once.
+    Returns (total, natural, reuse).
+    """
+    others_len = [len(v) for v in others]
+    natural = 0
+    for _path, _name, n in char_folders:
+        m = min([n] + others_len) if mode == 0 else n
+        natural += m
+    if count and count > 0:
+        total = min(10000, int(count))
+    else:
+        total = natural
+        if unique_2_5:
+            total = min(10000, max(natural, 1) * UNIQUE_AUTO_MULT)
+    if unique:
+        cap = min(others_len) if others_len else 0
+        total = min(total, natural, cap)
+    total = max(0, total)
+    return total, natural, total > natural
 
 
 def truncate_middle(s: str, max_len: int = 46) -> str:
@@ -4137,7 +4171,10 @@ class BatchCard(SidebarCard):
         s._inner.addWidget(self.next_preview)
 
         hint = QLabel("Каждый персонаж из folder_1 + folder_2…5 → одно готовое Reels-видео. "
-                      "0 = Auto: min длин для «Последовательно», len(folder_1) для «Рандом».")
+                      "«Сколько» задаёт точное число видео (до 10000): хуки и ролики 2–5 "
+                      "перебираются по кругу. 0 = Auto: по числу хуков; при включённой "
+                      "уникализации 2–5 (вкладка «Экспорт») — ×10, т.к. повтор исходников "
+                      "даёт уникальные видео.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         self.layout().addWidget(hint)
@@ -4192,23 +4229,15 @@ class BatchCard(SidebarCard):
         others = [list_videos(d) for d in FOLDER_DIRS[1:]]
         others_len = [len(v) for v in others]
         mode = self.mode_combo.currentIndex()
-        info = {"chars": [], "total": 0, "mode": mode, "others": others_len}
-        total = 0
+        unique_2_5 = bool(self.main and self.main.export_card.chk_unique25.isChecked())
+        total, natural, reuse = plan_batch(
+            char_folders, others, mode, self.count_spin.value(),
+            self.chk_unique.isChecked(), unique_2_5)
+        info = {"chars": [], "total": total, "natural": natural, "reuse": reuse,
+                "mode": mode, "others": others_len}
         for path, name, n in char_folders:
-            if mode == 0:
-                m = min([n] + others_len)
-            else:
-                m = n
+            m = min([n] + others_len) if mode == 0 else n
             info["chars"].append((name, n, m))
-            total += m
-        cnt = self.count_spin.value()
-        if cnt > 0:
-            total = min(total, cnt)
-        # with "unique 2-5" each build consumes one video from EVERY folder_2..5,
-        # so the batch cannot exceed the smallest folder's size
-        if self.chk_unique.isChecked() and others_len:
-            total = min(total, min(others_len))
-        info["total"] = total
         return info
 
     def update_info(self):
@@ -4216,7 +4245,12 @@ class BatchCard(SidebarCard):
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
-        extra = " · без повторов 2-5" if self.chk_unique.isChecked() else ""
+        if info["reuse"]:
+            extra = " · исходники переиспользуются"
+        elif self.chk_unique.isChecked():
+            extra = " · без повторов 2-5"
+        else:
+            extra = ""
         self.count_info.setText(
             f"В папках: {', '.join(parts)} → будет {info['total']} видео "
             f"[{mode_txt}{extra}]")
@@ -4725,31 +4759,37 @@ class BatchBuildWorker(QThread):
                 self.failed.emit("В папках folder_2…folder_5 должны быть видео.")
                 return
 
-            # ---------- build task list ----------
-            tasks: List[Tuple[str, str, int]] = []   # (char_folder, char_name, vid_idx)
+            # ---------- plan the batch ----------
             mode = bcfg["mode"]
-            for path, name, n in char_folders:
-                cv = list_videos(path)
-                if mode == 0:
-                    m = min(len(cv), *[len(v) for v in others])
-                else:
-                    m = len(cv)
-                for i in range(m):
-                    tasks.append((path, name, i))
-            cnt = bcfg["count"]
-            if cnt > 0:
-                tasks = tasks[:cnt]
-            # "unique 2-5": every build takes one video from EACH folder_2..5,
-            # so the whole batch is capped by the smallest folder's size
-            if bcfg["unique"]:
-                cap = min((len(v) for v in others), default=0)
-                tasks = tasks[:cap]
-            total = len(tasks)
+            unique_2_5 = bool(exp.get("unique_2_5", False))
+            total, natural, reuse = plan_batch(
+                char_folders, others, mode, bcfg["count"],
+                bcfg["unique"], unique_2_5)
             if total == 0:
                 self.failed.emit("Нечего собирать — 0 задач.")
                 return
 
-            self.progress.emit(1, f"Батч: {total} видео, потоков {bcfg['threads']}")
+            # characters that actually contain videos
+            active_chars: List[Tuple[str, str, List[str]]] = []
+            for path, name, n in char_folders:
+                cv = list_videos(path)
+                if cv:
+                    active_chars.append((path, name, cv))
+            if not active_chars:
+                self.failed.emit("Нет видео в folder_1 (у персонажей).")
+                return
+
+            # tasks: (char_folder, char_name, hook_path, seq). Hooks and 2-5 are
+            # cycled round-robin so ANY number of videos can be produced from a
+            # few source files — micro-crop uniquification keeps each render unique.
+            tasks: List[Tuple[str, str, str, int]] = []
+            for g in range(total):
+                path, name, cv = active_chars[g % len(active_chars)]
+                vid_idx = g // len(active_chars)
+                tasks.append((path, name, cv[vid_idx % len(cv)], g))
+
+            self.progress.emit(1, f"Батч: {total} видео, потоков {bcfg['threads']}"
+                               + (" (переиспользование)" if reuse else ""))
 
             # ---------- helpers ----------
             pools = [list(v) for v in others]
@@ -4783,7 +4823,7 @@ class BatchBuildWorker(QThread):
                                 v = pool[vid_idx % len(pool)]
                             else:
                                 v = random.choice(pool)
-                        if bcfg["delete"] or bcfg["move"]:
+                        if (bcfg["delete"] or bcfg["move"]) and not reuse:
                             pool.remove(v)
                     paths.append(v)
                 return paths
@@ -4804,16 +4844,12 @@ class BatchBuildWorker(QThread):
                         except Exception:
                             pass
 
-            def build_task(task: Tuple[str, str, int]) -> Optional[str]:
-                char_folder, char_name, vid_idx = task
-                cv = list_videos(char_folder)
-                if vid_idx >= len(cv):
-                    return None
-                f1 = cv[vid_idx]
-                vp = pick_videos(f1, char_name, vid_idx)
+            def build_task(task: Tuple[str, str, str, int]) -> Optional[str]:
+                char_folder, char_name, hook_path, seq = task
+                vp = pick_videos(hook_path, char_name, seq)
                 if not vp:
                     return None
-                out_name = f"{char_name}_{vid_idx + 1:04d}.mp4"
+                out_name = f"{char_name}_{seq + 1:04d}.mp4"
                 out_path = os.path.join(OUTPUT_DIR, out_name)
                 if os.path.exists(out_path):
                     base, ext = os.path.splitext(out_name)
