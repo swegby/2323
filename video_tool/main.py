@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.9"
+APP_VERSION = "v2.10"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -165,6 +165,15 @@ FPS_CHOICES = [30, 24, 60]
 # reuse of the same source files is then safe and intended.
 UNIQUE_AUTO_MULT = 10
 
+# Micro-crop uniquification ranges. Kept deliberately tiny so the change is
+# invisible to the eye (crop 0.5–1.5% + colour drift <1%), while the crop +
+# re-interpolation still rewrites essentially every pixel on each render.
+UNIQUE_CROP_MIN = 0.985    # keep 98.5% of the frame (crop ≤ 1.5%)
+UNIQUE_CROP_MAX = 0.995    # keep 99.5% of the frame (crop ≥ 0.5%)
+UNIQUE_BRIGHT = 0.008      # brightness ±0.8%
+UNIQUE_COLOR_MIN = 0.995   # contrast / saturation 99.5%…
+UNIQUE_COLOR_MAX = 1.005   # …101.5%
+
 # ======================================================================
 #  FILE SYSTEM HELPERS
 # ======================================================================
@@ -261,8 +270,11 @@ def plan_batch(char_folders: List[Tuple[str, str, int]],
         if unique_2_5:
             total = min(10000, max(natural, 1) * UNIQUE_AUTO_MULT)
     if unique:
+        # "без повторов 2-5" limits only the 2-5 files (one per build from each
+        # folder) — hooks may still be cycled/reused, so do NOT cap by `natural`.
         cap = min(others_len) if others_len else 0
-        total = min(total, natural, cap)
+        if cap > 0:
+            total = min(total, cap)
     total = max(0, total)
     return total, natural, total > natural
 
@@ -1171,17 +1183,17 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
 def _unique_prefilters() -> str:
     """Random micro-transform for content-uniquification of segments 2-5.
 
-    Crops a random ~1-3% off the frame at a random offset (micro-crop/zoom) and
-    adds a tiny color shift. The result looks virtually identical to the eye but
-    produces different pixels / frame hashes on every render — so automated
-    duplicate detection sees each video as unique.
+    Crops a random ~0.5-1.5% off the frame at a random offset (micro-crop/zoom)
+    and adds a tiny (<1%) color drift. The change is invisible to the eye, but
+    the crop + re-interpolation rewrites essentially every pixel, so each render
+    yields a different frame hash / byte stream.
     """
-    k = round(random.uniform(0.97, 0.99), 4)            # keep 97-99% of the frame
-    fx = round(random.uniform(0.0, (1.0 - k) * 0.8), 4)
-    fy = round(random.uniform(0.0, (1.0 - k) * 0.8), 4)
-    br = round(random.uniform(-0.02, 0.02), 3)
-    ct = round(random.uniform(0.985, 1.015), 3)
-    st = round(random.uniform(0.985, 1.015), 3)
+    k = round(random.uniform(UNIQUE_CROP_MIN, UNIQUE_CROP_MAX), 4)
+    fx = round(random.uniform(0.0, 1.0 - k), 4)
+    fy = round(random.uniform(0.0, 1.0 - k), 4)
+    br = round(random.uniform(-UNIQUE_BRIGHT, UNIQUE_BRIGHT), 3)
+    ct = round(random.uniform(UNIQUE_COLOR_MIN, UNIQUE_COLOR_MAX), 3)
+    st = round(random.uniform(UNIQUE_COLOR_MIN, UNIQUE_COLOR_MAX), 3)
     return (f"crop=floor(iw*{k}):floor(ih*{k})"
             f":x=floor(iw*{fx}):y=floor(ih*{fy}),"
             f"eq=brightness={br}:contrast={ct}:saturation={st}")
@@ -1780,8 +1792,8 @@ def run_moviepy(video_paths: List[str],
                                      x1=x_crop, x2=x_crop + canvas_w)
                 clip = _call_any(clip, ("resized", "resize"), (canvas_w, canvas_h))
                 if unique_2_5 and i > 0:
-                    # micro-crop/zoom so each render differs slightly
-                    m = max(1, int(canvas_w * random.uniform(0.005, 0.02)))
+                    # micro-crop/zoom so each render differs slightly (0.3-1%)
+                    m = max(1, int(canvas_w * random.uniform(0.003, 0.01)))
                     x1 = random.randint(0, m); y1 = random.randint(0, m)
                     x2 = canvas_w - random.randint(0, m)
                     y2 = canvas_h - random.randint(0, m)
@@ -4165,6 +4177,11 @@ class BatchCard(SidebarCard):
         self.count_info.setWordWrap(True)
         s._inner.addWidget(self.count_info)
 
+        self.uniq_status = QLabel("")
+        self.uniq_status.setObjectName("Hint")
+        self.uniq_status.setWordWrap(True)
+        s._inner.addWidget(self.uniq_status)
+
         self.next_preview = QLabel("")
         self.next_preview.setObjectName("Hint")
         self.next_preview.setWordWrap(True)
@@ -4234,7 +4251,7 @@ class BatchCard(SidebarCard):
             char_folders, others, mode, self.count_spin.value(),
             self.chk_unique.isChecked(), unique_2_5)
         info = {"chars": [], "total": total, "natural": natural, "reuse": reuse,
-                "mode": mode, "others": others_len}
+                "mode": mode, "others": others_len, "unique_2_5": unique_2_5}
         for path, name, n in char_folders:
             m = min([n] + others_len) if mode == 0 else n
             info["chars"].append((name, n, m))
@@ -4254,6 +4271,18 @@ class BatchCard(SidebarCard):
         self.count_info.setText(
             f"В папках: {', '.join(parts)} → будет {info['total']} видео "
             f"[{mode_txt}{extra}]")
+
+        # live status of the micro-crop uniquification (lives in the Export tab)
+        if info["unique_2_5"]:
+            self.uniq_status.setText("🎲 Уникализация 2–5: ВКЛ — каждое видео получит "
+                                     "уникальные пиксели, даже при повторе исходников.")
+        elif info["reuse"]:
+            self.uniq_status.setText("⚠️ Уникализация 2–5 ВЫКЛ: повторы исходников дадут "
+                                     "одинаковые видео. Включи её во вкладке «Экспорт».")
+        else:
+            self.uniq_status.setText("Уникализация 2–5: ВЫКЛ (вкладка «Экспорт»). "
+                                     "Повторов исходников нет — видео и так разные.")
+
         # next batch preview
         if self.main:
             nxt = self.main.peek_next_batch(info["chars"])
@@ -4829,6 +4858,10 @@ class BatchBuildWorker(QThread):
                 return paths
 
             def handle_used(video_paths: List[str]):
+                # never delete/move while sources are being reused — the same
+                # files are needed again for later videos in this batch
+                if reuse:
+                    return
                 for pi, vp in enumerate(video_paths[1:], start=1):
                     if bcfg["move"] and os.path.isfile(vp):
                         dest_dir = os.path.join(USED_DIR, FOLDERS[pi])
