@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.6"
+APP_VERSION = "v2.7"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,11 +80,18 @@ FONT_OSWALD = os.path.join(FONTS_DIR, "Oswald-Bold.ttf")
 PROJECT_JSON = os.path.join(BASE_DIR, "project.json")
 CHARACTERS_JSON = os.path.join(BASE_DIR, "characters.json")
 FFMPEG_PATH_JSON = os.path.join(BASE_DIR, "ffmpeg_path.json")
+MUSIC_DIR = os.path.join(BASE_DIR, "music")
 
 # ------------------------------------------------------- CONSTANTS ---
 VIDEO_EXTS = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v",
     ".ts", ".flv", ".wmv", ".3gp", ".mpeg", ".mpg", ".ogv",
+}
+
+# Audio files accepted as background music (ffmpeg decodes them all)
+MUSIC_EXTS = {
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus",
+    ".wma", ".aiff", ".aif", ".m4b", ".mp2", ".ac3", ".amr",
 }
 
 # Bright color map used by [blue]...[ /blue] tags and quick buttons
@@ -159,7 +166,7 @@ FPS_CHOICES = [30, 24, 60]
 # ======================================================================
 
 def ensure_dirs() -> None:
-    for d in FOLDER_DIRS + [OUTPUT_DIR, USED_DIR, FONTS_DIR]:
+    for d in FOLDER_DIRS + [OUTPUT_DIR, USED_DIR, FONTS_DIR, MUSIC_DIR]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -182,6 +189,33 @@ def list_videos(folder: str) -> List[str]:
     except OSError:
         return []
     return sorted(out, key=natural_key)
+
+
+def list_music_files() -> List[str]:
+    """All audio files in music/ (flat), naturally sorted."""
+    if not os.path.isdir(MUSIC_DIR):
+        return []
+    out = []
+    try:
+        for fn in os.listdir(MUSIC_DIR):
+            full = os.path.join(MUSIC_DIR, fn)
+            if os.path.isfile(full) and os.path.splitext(fn)[1].lower() in MUSIC_EXTS:
+                out.append(full)
+    except OSError:
+        return []
+    return sorted(out, key=natural_key)
+
+
+def default_music_config() -> Dict[str, Any]:
+    """Music overlay settings. 'drop_time' is the timestamp INSIDE the track
+    where the drop hits — it is aligned to the hook→2nd-video transition."""
+    return {
+        "enabled": False,
+        "volume": 0.9,          # music volume 0.0–1.0 (relative to original)
+        "keep_original": True,  # mix music over the video's own audio
+        "align_drop": True,     # drop lands exactly on the hook→seg2 cut
+        "tracks": {},           # {basename: {"drop_time": seconds}}
+    }
 
 
 def open_folder(path: str) -> None:
@@ -339,6 +373,19 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             e["fps"] = _to_int(e.get("fps"), 30)
     except Exception:
         pass
+    try:
+        m = data.get("music")
+        if not isinstance(m, dict):
+            m = {}
+        m["enabled"] = bool(m.get("enabled", False))
+        m["volume"] = max(0.0, min(2.0, _to_float(m.get("volume"), 0.9)))
+        m["keep_original"] = bool(m.get("keep_original", True))
+        m["align_drop"] = bool(m.get("align_drop", True))
+        if not isinstance(m.get("tracks"), dict):
+            m["tracks"] = {}
+        data["music"] = m
+    except Exception:
+        pass
     return data
 
 
@@ -413,8 +460,11 @@ def load_project() -> Dict[str, Any]:
         "batch": {},
         "ui": {},
         "ffmpeg_path": "",
+        "music": default_music_config(),
     })
-    return sanitize_project(data)
+    data = sanitize_project(data)
+    data.setdefault("music", default_music_config())
+    return data
 
 
 # ======================================================================
@@ -1357,6 +1407,177 @@ def build_one_final_ffmpeg(video_paths: List[str],
         return True, ""
     finally:
         shutil.rmtree(temp, ignore_errors=True)
+
+# ======================================================================
+#  MUSIC OVERLAY — build-up → drop → energy beat
+# ======================================================================
+
+def pick_music(music_cfg: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+    """Choose a track to lay over the video: (path, drop_time).
+
+    The user drops their own files into music/ — we never bundle or fetch
+    copyrighted tracks. One random file is picked per build.
+    """
+    if not music_cfg or not music_cfg.get("enabled"):
+        return None
+    files = list_music_files()
+    if not files:
+        return None
+    tracks = music_cfg.get("tracks", {}) if isinstance(music_cfg.get("tracks"), dict) else {}
+    path = random.choice(files)
+    drop = 0.0
+    try:
+        drop = _to_float(tracks.get(os.path.basename(path), {}).get("drop_time"), 0.0)
+    except Exception:
+        drop = 0.0
+    return path, drop
+
+
+def detect_drop_time(path: str, ffmpeg_exe: str, window: float = 0.5) -> float:
+    """Estimate where the drop is in a track.
+
+    Decodes the track to low-rate mono PCM and measures RMS loudness per
+    *window* seconds, then returns the time of the biggest positive energy jump
+    — i.e. the moment the beat "drops" after a build-up. Returns 0.0 when it
+    cannot be detected.
+    """
+    rate = 8000
+    try:
+        r = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+             "-i", path, "-vn", "-ac", "1", "-ar", str(rate),
+             "-f", "s16le", "-"],
+            capture_output=True, timeout=900,
+        )
+        data = r.stdout or b""
+        if len(data) < rate * 2 * 4:              # need at least 4 windows
+            return 0.0
+
+        win = max(1, int(rate * window))
+        try:
+            import numpy as np
+            samples = np.frombuffer(data, dtype="<i2").astype(np.float64)
+        except Exception:
+            # pure-python fallback (no numpy)
+            samples = [float(int.from_bytes(data[i:i + 2], "little", signed=True))
+                       for i in range(0, len(data) - 1, 2)]
+
+        rms: List[float] = []
+        n = len(samples)
+        for i in range(0, n, win):
+            chunk = samples[i:i + win]
+            if len(chunk) < win // 2:
+                break
+            s = 0.0
+            for v in chunk:
+                s += v * v
+            rms.append((s / len(chunk)) ** 0.5)
+        if len(rms) < 4:
+            return 0.0
+
+        best_t, best_gain = 0.0, 0.0
+        for i in range(1, len(rms)):
+            prev = max(rms[max(0, i - 4):i])       # recent energy before
+            gain = rms[i] - prev
+            if gain > best_gain:
+                best_gain, best_t = gain, i * window
+        return round(best_t, 2)
+    except Exception:
+        return 0.0
+
+
+def mux_music(video_path: str, music_path: str, drop_time: float,
+              hook_dur: float, volume: float, keep_original: bool,
+              align_drop: bool, out_final: str, ffmpeg_exe: str,
+              audio_kbps: int = 192) -> Tuple[bool, str]:
+    """Overlay a music track onto a finished video.
+
+    The track is started so that its *drop_time* lands exactly on the
+    hook→2nd-video cut (end of segment 0): the build-up plays during the hook,
+    then the drop hits as the second video begins. Volume 0–2 (1.0 = original
+    level), keep_original=False replaces the video audio entirely.
+    """
+    try:
+        if not os.path.isfile(music_path):
+            return False, f"трек не найден: {music_path}"
+        vd = get_video_duration(video_path, ffmpeg_exe)
+        if vd <= 0.5:
+            return False, "не удалось определить длительность видео"
+        md = get_video_duration(music_path, ffmpeg_exe)
+        if md <= 0.5:
+            return False, "трек пустой/не читается"
+
+        # how much of the track to skip so the drop hits at t = hook_dur
+        lead = 0.0
+        delay_ms = 0
+        if align_drop and drop_time > 0 and hook_dur > 0:
+            lead = drop_time - hook_dur
+            if lead < 0:
+                delay_ms = int(round((hook_dur - drop_time) * 1000.0))
+                lead = 0.0
+
+        has_audio = video_has_audio(video_path, ffmpeg_exe)
+        need_null = keep_original and not has_audio
+
+        cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", video_path]
+        if lead > 0.01:
+            cmd += ["-ss", f"{lead:.3f}"]
+        cmd += ["-i", music_path]
+        if need_null:
+            cmd += ["-f", "lavfi", "-t", f"{vd:.3f}", "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=44100"]
+
+        vol = max(0.0, min(2.0, float(volume)))
+        fc: List[str] = []
+        mus = ("[1:a]aformat=sample_fmts=fltp:sample_rates=44100:"
+               "channel_layouts=stereo")
+        if delay_ms > 0:
+            mus += f",adelay={delay_ms}:all=1"
+        mus += f",volume={vol:.3f},atrim=duration={vd:.3f}[mus]"
+        fc.append(mus)
+
+        if keep_original:
+            src = "[0:a]" if has_audio else "[2:a]"
+            fc.append(src + "aformat=sample_fmts=fltp:sample_rates=44100:"
+                           "channel_layouts=stereo[orig]")
+            fc.append("[orig][mus]amix=inputs=2:duration=first:"
+                      "dropout_transition=0:normalize=0[aout]")
+        else:
+            fc.append("[mus]anull[aout]")
+
+        cmd += ["-filter_complex", ";".join(fc)]
+        cmd += ["-map", "0:v", "-map", "[aout]"]
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+                "-ar", "44100", "-ac", "2"]
+        cmd += ["-t", f"{vd:.3f}", "-movflags", "+faststart", out_final + ".mix.mp4"]
+
+        r = subprocess.run(cmd, capture_output=True, timeout=1800)
+        tmp = out_final + ".mix.mp4"
+        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 1024:
+            return False, r.stderr.decode("utf-8", "replace")[-1500:] or "микс не создан"
+        os.replace(tmp, out_final)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def apply_music(out_path: str, music_cfg: Dict[str, Any], hook_dur: float,
+                ffmpeg_exe: str, audio_kbps: int = 192) -> Tuple[bool, str]:
+    """Post-process hook: lay music over a freshly built video (if enabled)."""
+    if not music_cfg or not music_cfg.get("enabled"):
+        return True, ""
+    track = pick_music(music_cfg)
+    if not track:
+        return True, ""
+    path, drop = track
+    return mux_music(
+        out_path, path, drop, hook_dur,
+        _to_float(music_cfg.get("volume"), 0.9),
+        bool(music_cfg.get("keep_original", True)),
+        bool(music_cfg.get("align_drop", True)),
+        out_path, ffmpeg_exe, audio_kbps,
+    )
 
 # ======================================================================
 #  TELEGRAM
@@ -4071,6 +4292,206 @@ class FfmpegCard(SidebarCard):
         self.configChanged.emit()
 
 # ======================================================================
+#  MUSIC CARD — trending-track overlay with a drop on the hook→seg2 cut
+# ======================================================================
+
+class MusicCard(SidebarCard):
+    configChanged = pyqtSignal()
+    dropDetected = pyqtSignal(str, float)          # filename, detected drop (s)
+
+    def __init__(self, main_window=None):
+        super().__init__("Музыка", main_window)
+        self.dropDetected.connect(self._on_drop_detected)
+        self._cfg = default_music_config()
+        self._track_rows: Dict[str, Tuple[QDoubleSpinBox, QPushButton]] = {}
+
+        s0 = self._add_section()
+        self.chk_enable = QCheckBox("Наложить музыку")
+        self.chk_enable.setToolTip("Каждое видео собирается со случайным треком из папки music/")
+        self.chk_enable.toggled.connect(self._changed)
+        s0._inner.addWidget(self.chk_enable)
+        self.chk_keep = QCheckBox("Оставить звук видео (микс)")
+        self.chk_keep.setToolTip("Трек накладывается поверх родного звука. "
+                                 "Выключи — останется только музыка.")
+        self.chk_keep.toggled.connect(self._changed)
+        s0._inner.addWidget(self.chk_keep)
+        self.chk_align = QCheckBox("Дроп точно на переход 1→2")
+        self.chk_align.setToolTip("Хук (1-е видео) — нагнетание, в момент смены на "
+                                  "2-е видео бьёт дроп. Нужно указать время дропа в треке.")
+        self.chk_align.toggled.connect(self._changed)
+        s0._inner.addWidget(self.chk_align)
+
+        s1 = self._add_section("Громкость музыки")
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(90)
+        self.vol_slider.valueChanged.connect(self._on_vol)
+        s1._inner.addWidget(self.vol_slider)
+        self.vol_label = QLabel("90%")
+        self.vol_label.setObjectName("Hint")
+        s1._inner.addWidget(self.vol_label)
+
+        s2 = self._add_section("Треки — папка music/")
+        head = QHBoxLayout()
+        self.btn_open = QPushButton("Открыть папку")
+        self.btn_open.setObjectName("SmallBtn")
+        self.btn_open.clicked.connect(lambda: open_folder(MUSIC_DIR))
+        self.btn_refresh = QPushButton("Обновить")
+        self.btn_refresh.setObjectName("SmallBtn")
+        self.btn_refresh.clicked.connect(self.refresh_tracks)
+        head.addWidget(self.btn_open)
+        head.addWidget(self.btn_refresh)
+        head.addStretch(1)
+        s2._inner.addLayout(head)
+
+        self.tracks_scroll = QScrollArea()
+        self.tracks_scroll.setWidgetResizable(True)
+        self.tracks_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tracks_scroll.setMinimumHeight(90)
+        self.tracks_scroll.setMaximumHeight(260)
+        self.tracks_host = QWidget()
+        self.tracks_vbox = QVBoxLayout(self.tracks_host)
+        self.tracks_vbox.setContentsMargins(0, 0, 0, 0)
+        self.tracks_vbox.setSpacing(6)
+        self.tracks_scroll.setWidget(self.tracks_host)
+        s2._inner.addWidget(self.tracks_scroll)
+
+        hint = QLabel("Положи СВОИ треки (MP3/WAV/M4A…) в папку music/.\n"
+                      "«Время дропа» — секунда внутри трека, где бьёт дроп.\n"
+                      "Кнопка «Авто» найдёт её сама (по скачку энергии).\n"
+                      "Используй только треки, на которые у тебя есть права,\n"
+                      "или роялти-фри библиотеки.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        self.layout().addWidget(hint)
+
+        self.refresh_tracks()
+
+    def _changed(self, _=None):
+        self.configChanged.emit()
+
+    def _on_vol(self, v: int):
+        self.vol_label.setText(f"{v}%")
+        self._changed()
+
+    def _make_track_row(self, path: str) -> QFrame:
+        name = os.path.basename(path)
+        row = QFrame()
+        row.setObjectName("CharRow")
+        lay = QVBoxLayout(row)
+        lay.setContentsMargins(10, 7, 10, 7)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        lbl = QLabel("🎵 " + truncate_middle(name, 30))
+        lbl.setStyleSheet("font-weight: 600; color: #E8EAF2;")
+        lbl.setToolTip(path)
+        head.addWidget(lbl, 1)
+        lay.addLayout(head)
+
+        act = QHBoxLayout()
+        act.setSpacing(6)
+        act.addWidget(QLabel("Дроп, с:"))
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 600.0)
+        spin.setSingleStep(0.5)
+        spin.setDecimals(1)
+        spin.setValue(self._cfg.get("tracks", {}).get(name, {}).get("drop_time", 0.0) or 0.0)
+        spin.valueChanged.connect(self._changed)
+        act.addWidget(spin, 1)
+        btn = QPushButton("Авто")
+        btn.setObjectName("SmallBtn")
+        btn.setToolTip("Найти дроп автоматически (анализ громкости)")
+        btn.clicked.connect(lambda _, p=path, nm=name: self._detect_drop(p, nm))
+        act.addWidget(btn)
+        lay.addLayout(act)
+
+        self._track_rows[name] = (spin, btn)
+        return row
+
+    def refresh_tracks(self):
+        while self.tracks_vbox.count():
+            item = self.tracks_vbox.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setVisible(False)
+                w.setParent(None)
+                w.deleteLater()
+        self._track_rows = {}
+        files = list_music_files()
+        if not files:
+            empty = QLabel("Нет треков. Положи MP3/WAV в папку music/")
+            empty.setObjectName("Hint")
+            empty.setWordWrap(True)
+            self.tracks_vbox.addWidget(empty)
+        for path in files:
+            self.tracks_vbox.addWidget(self._make_track_row(path))
+        self.tracks_vbox.addStretch(1)
+        self._changed()
+
+    def _detect_drop(self, path: str, name: str):
+        if name in self._track_rows:
+            self._track_rows[name][1].setEnabled(False)
+            self._track_rows[name][1].setText("…")
+        self.status_hint(f"🔍 Ищу дроп в {truncate_middle(name, 20)}…")
+        QApplication.processEvents()
+
+        def work():
+            return detect_drop_time(path, get_ffmpeg_exe())
+
+        def done():
+            val = work()
+            self.dropDetected.emit(name, val)
+        threading.Thread(target=done, daemon=True).start()
+
+    def _on_drop_detected(self, name: str, val: float):
+        if name in self._track_rows:
+            spin, btn = self._track_rows[name]
+            btn.setEnabled(True)
+            btn.setText("Авто")
+            if val > 0:
+                spin.setValue(val)
+                self.status_hint(f"✅ Дроп: {val:.1f} с")
+            else:
+                self.status_hint("⚠️ Дроп не найден — поставь время вручную", bad=True)
+        self._changed()
+
+    def status_hint(self, msg: str, bad: bool = False):
+        if self.main:
+            self.main.status(msg, bad=bad)
+
+    def get_music_config(self) -> Dict[str, Any]:
+        cfg = dict(self._cfg)
+        cfg["enabled"] = self.chk_enable.isChecked()
+        cfg["keep_original"] = self.chk_keep.isChecked()
+        cfg["align_drop"] = self.chk_align.isChecked()
+        cfg["volume"] = round(self.vol_slider.value() / 100.0, 2)
+        cfg["tracks"] = dict(self._cfg.get("tracks", {}))
+        for name, (spin, _btn) in self._track_rows.items():
+            cfg["tracks"][name] = {"drop_time": round(spin.value(), 2)}
+        return cfg
+
+    def set_music_config(self, cfg: Dict[str, Any]):
+        if not isinstance(cfg, dict):
+            cfg = {}
+        self._cfg = default_music_config()
+        self._cfg.update(cfg)
+        self._cfg["tracks"] = dict(cfg.get("tracks", {}))
+        for w in (self.chk_enable, self.chk_keep, self.chk_align):
+            w.blockSignals(True)
+        self.chk_enable.setChecked(bool(cfg.get("enabled", False)))
+        self.chk_keep.setChecked(bool(cfg.get("keep_original", True)))
+        self.chk_align.setChecked(bool(cfg.get("align_drop", True)))
+        for w in (self.chk_enable, self.chk_keep, self.chk_align):
+            w.blockSignals(False)
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(int(round(_to_float(cfg.get("volume"), 0.9) * 100)))
+        self.vol_slider.blockSignals(False)
+        self.vol_label.setText(f"{self.vol_slider.value()}%")
+        self.refresh_tracks()
+
+# ======================================================================
 #  WORKERS
 # ======================================================================
 
@@ -4156,6 +4577,15 @@ class BuildWorker(QThread):
                 if not ok2:
                     self.failed.emit(f"Ошибка: {err}\nMoviePy: {err2}")
                     return
+            # ---- music overlay (build-up → drop → energy beat) ----
+            akbps = 256 if exp["quality_text"].startswith("💎") else 192
+            ok_m, err_m = apply_music(
+                out_path, self.main.music_card.get_music_config(),
+                durs[0], ff, akbps)
+            if not ok_m:
+                self.failed.emit(
+                    f"Видео собрано, но музыку наложить не удалось:\n{err_m}")
+                return
             self.progress.emit(97, "Готово")
             self.file_done.emit(out_path)
             self.finished_ok.emit(out_path)
@@ -4204,6 +4634,8 @@ class BatchBuildWorker(QThread):
             durs = [c.duration for c in self.main.cards]
             rand_flags = [c.chk_random.isChecked() for c in self.main.cards]
             rand_idx = [c.current_idx for c in self.main.cards]
+            music_cfg = self.main.music_card.get_music_config()
+            akbps = 256 if exp["quality_text"].startswith("💎") else 192
 
             char_folders = self.main.characters_card.get_filtered_character_folders()
             if not char_folders:
@@ -4306,10 +4738,14 @@ class BatchBuildWorker(QThread):
                     with_audio=exp["audio"], uppercase=exp["uppercase"],
                     ten_bit=exp.get("ten_bit", False),
                     blur_fill=exp.get("blur_fill", False),
-                    audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
+                    audio_kbps=akbps,
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
+                    return None
+                ok_m, err_m = apply_music(out_path, music_cfg, durs[0], ff, akbps)
+                if not ok_m:
+                    print(f"[batch] music {out_name}: {err_m}")
                     return None
                 handle_used(vp)
                 # Telegram auto-send is handled on the GUI thread via
@@ -4470,7 +4906,7 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(1)
         splitter.setChildrenCollapsible(False)
 
-        # ---- left sidebar: 4 tabs (each section gets its own scroll) ----
+        # ---- left sidebar: 5 tabs (each section gets its own scroll) ----
         self.sidebar_host = QWidget()
         self.sidebar_host.setMinimumWidth(336)
         self.sidebar_host.setMaximumWidth(400)
@@ -4484,6 +4920,7 @@ class MainWindow(QMainWindow):
         self.characters_card = CharactersCard(self)
         self.batch_card = BatchCard(self)
         self.ffmpeg_card = FfmpegCard(self)
+        self.music_card = MusicCard(self)
 
         self.sidebar_tabs = QTabWidget()
         self.sidebar_tabs.setObjectName("SidebarTabs")
@@ -4494,6 +4931,7 @@ class MainWindow(QMainWindow):
             ("Персонажи", self.characters_card),
             ("Батч", self.batch_card),
             ("FFMPEG", self.ffmpeg_card),
+            ("Музыка", self.music_card),
         ]:
             page = QScrollArea()
             page.setWidgetResizable(True)
@@ -4549,6 +4987,7 @@ class MainWindow(QMainWindow):
         self.characters_card.configChanged.connect(self._on_batch_config_changed)
         self.batch_card.configChanged.connect(self._on_batch_config_changed)
         self.ffmpeg_card.configChanged.connect(self._on_config_changed)
+        self.music_card.configChanged.connect(self._on_config_changed)
 
         self.stack.currentChanged.connect(self._on_tab_changed)
 
@@ -4614,6 +5053,7 @@ class MainWindow(QMainWindow):
                 "next_build_index": self.next_build_index,
                 "video_counter": self.video_counter,
             },
+            "music": self.music_card.get_music_config(),
             "ffmpeg_path": load_saved_ffmpeg_path(),
         }
         save_json(PROJECT_JSON, self.project)
@@ -4636,6 +5076,10 @@ class MainWindow(QMainWindow):
                 self.batch_card.set_batch_config(self.project.get("batch", {}))
             except Exception:
                 traceback.print_exc()
+            try:
+                self.music_card.set_music_config(self.project.get("music", {}))
+            except Exception:
+                traceback.print_exc()
             ui = self.project.get("ui", {}) if isinstance(
                 self.project.get("ui", {}), dict) else {}
             self.next_build_index = max(0, _to_int(ui.get("next_build_index"), 0))
@@ -4653,7 +5097,7 @@ class MainWindow(QMainWindow):
             ui = self.project.get("ui", {}) if isinstance(
                 self.project.get("ui", {}), dict) else {}
             side_tab = _to_int(ui.get("sidebar_tab"), 0)
-            self.sidebar_tabs.setCurrentIndex(min(3, max(0, side_tab)))
+            self.sidebar_tabs.setCurrentIndex(min(4, max(0, side_tab)))
         except Exception:
             pass
 
