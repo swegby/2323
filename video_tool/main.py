@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.7"
+APP_VERSION = "v2.8"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -373,6 +373,7 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             e["resolution_index"] = _to_int(e.get("resolution_index"), 0)
             e["fps"] = _to_int(e.get("fps"), 30)
             e["no_speedup"] = bool(e.get("no_speedup", False))
+            e["unique_2_5"] = bool(e.get("unique_2_5", False))
     except Exception:
         pass
     try:
@@ -1133,6 +1134,25 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
     )
 
 
+def _unique_prefilters() -> str:
+    """Random micro-transform for content-uniquification of segments 2-5.
+
+    Crops a random ~1-3% off the frame at a random offset (micro-crop/zoom) and
+    adds a tiny color shift. The result looks virtually identical to the eye but
+    produces different pixels / frame hashes on every render — so automated
+    duplicate detection sees each video as unique.
+    """
+    k = round(random.uniform(0.97, 0.99), 4)            # keep 97-99% of the frame
+    fx = round(random.uniform(0.0, (1.0 - k) * 0.8), 4)
+    fy = round(random.uniform(0.0, (1.0 - k) * 0.8), 4)
+    br = round(random.uniform(-0.02, 0.02), 3)
+    ct = round(random.uniform(0.985, 1.015), 3)
+    st = round(random.uniform(0.985, 1.015), 3)
+    return (f"crop=floor(iw*{k}):floor(ih*{k})"
+            f":x=floor(iw*{fx}):y=floor(ih*{fy}),"
+            f"eq=brightness={br}:contrast={ct}:saturation={st}")
+
+
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          target_dur: float, is_first: bool, orig_dur: float,
                          seg_out: str, ffmpeg_exe: str, crf: int = 18,
@@ -1142,6 +1162,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          ten_bit: bool = False, blur_fill: bool = False,
                          audio_kbps: int = 192,
                          no_speedup_first: bool = False,
+                         unique: bool = False,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
@@ -1163,6 +1184,8 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         pix = "yuv420p10le" if use10 else "yuv420p"
 
         bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        if unique and not is_first:
+            bg_chain = _unique_prefilters() + "," + bg_chain
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
@@ -1321,6 +1344,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            blur_fill: bool = False,
                            audio_kbps: int = 192,
                            no_speedup: bool = False,
+                           unique_2_5: bool = False,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
                            progress_cb=None) -> Tuple[bool, str]:
@@ -1367,6 +1391,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
                 no_speedup_first=no_speedup,
+                unique=unique_2_5,
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -1678,6 +1703,7 @@ def run_moviepy(video_paths: List[str],
                 fps: int = 30, with_audio: bool = True,
                 uppercase: bool = False,
                 no_speedup: bool = False,
+                unique_2_5: bool = False,
                 random_flags: Optional[List[bool]] = None,
                 preset_indices: Optional[List[int]] = None,
                 progress_cb=None) -> Tuple[bool, str]:
@@ -1719,6 +1745,15 @@ def run_moviepy(video_paths: List[str],
                     clip = _call_any(clip, ("cropped", "crop"),
                                      x1=x_crop, x2=x_crop + canvas_w)
                 clip = _call_any(clip, ("resized", "resize"), (canvas_w, canvas_h))
+                if unique_2_5 and i > 0:
+                    # micro-crop/zoom so each render differs slightly
+                    m = max(1, int(canvas_w * random.uniform(0.005, 0.02)))
+                    x1 = random.randint(0, m); y1 = random.randint(0, m)
+                    x2 = canvas_w - random.randint(0, m)
+                    y2 = canvas_h - random.randint(0, m)
+                    clip = _call_any(clip, ("cropped", "crop"),
+                                     x1=x1, y1=y1, x2=x2, y2=y2)
+                    clip = _call_any(clip, ("resized", "resize"), (canvas_w, canvas_h))
                 if i == 0 and clip.duration > target_durs[0] and not no_speedup:
                     clip = _call_any(clip, ("with_speed_scaled", "with_speed", "speedx"),
                                      clip.duration / target_durs[0])
@@ -3565,12 +3600,18 @@ class ExportCard(SidebarCard):
             "По умолчанию 1-е видео (хук), если оно длиннее нужной длительности, "
             "ускоряется. С этой галкой хук НЕ ускоряется, а обрезается с конца — "
             "как сегменты 2–5 (остаётся его естественная скорость).")
+        self.chk_unique25 = QCheckBox("Уникализация 2–5 (микро-кроп)")
+        self.chk_unique25.setToolTip(
+            "Каждый сегмент 2–5 получает случайный микро-кроп/зум + лёгкий сдвиг "
+            "цвета: глазу почти незаметно, но каждый рендер уникален для алгоритмов "
+            "детекции повторов (TikTok / YouTube / хэши кадров).")
         s2._inner.addWidget(self.chk_audio)
         s2._inner.addWidget(self.chk_caps)
         s2._inner.addWidget(self.chk_tenbit)
         s2._inner.addWidget(self.chk_blur)
         s2._inner.addWidget(self.chk_econ)
         s2._inner.addWidget(self.chk_nospeed)
+        s2._inner.addWidget(self.chk_unique25)
 
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
@@ -3587,7 +3628,7 @@ class ExportCard(SidebarCard):
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ, self.chk_nospeed):
+                  self.chk_econ, self.chk_nospeed, self.chk_unique25):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
                 else w.toggled.connect(self._changed)
 
@@ -3609,6 +3650,7 @@ class ExportCard(SidebarCard):
             "blur_fill": self.chk_blur.isChecked(),
             "econ": self.chk_econ.isChecked(),
             "no_speedup": self.chk_nospeed.isChecked(),
+            "unique_2_5": self.chk_unique25.isChecked(),
             "crf": q["crf"],
             "preset": q["preset"],
             "quality_text": q["label"],
@@ -3619,7 +3661,7 @@ class ExportCard(SidebarCard):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ, self.chk_nospeed):
+                  self.chk_econ, self.chk_nospeed, self.chk_unique25):
             w.blockSignals(True)
         if "resolution_index" in cfg:
             self.res_combo.setCurrentIndex(
@@ -3645,9 +3687,10 @@ class ExportCard(SidebarCard):
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
         if "no_speedup" in cfg: self.chk_nospeed.setChecked(bool(cfg["no_speedup"]))
+        if "unique_2_5" in cfg: self.chk_unique25.setChecked(bool(cfg["unique_2_5"]))
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ, self.chk_nospeed):
+                  self.chk_econ, self.chk_nospeed, self.chk_unique25):
             w.blockSignals(False)
 
 # ======================================================================
@@ -4058,10 +4101,12 @@ class BatchCard(SidebarCard):
         row1.addStretch(1)
         s._inner.addLayout(row1)
 
-        self.chk_unique = QCheckBox("Уникальные 2–5 (без повторов)")
+        self.chk_unique = QCheckBox("Без повторов 2–5 (в батче)")
         self.chk_unique.setToolTip(
-            "Каждое видео из folder_2…folder_5 используется в батче только один раз. "
-            "Файлы при этом НЕ удаляются — просто одно и то же видео не берётся повторно.")
+            "Каждый ролик из folder_2…folder_5 используется в батче максимум 1 раз. "
+            "Файлы НЕ удаляются — просто один и тот же ролик не берётся повторно.")
+        # NOTE: this is a PICK strategy. «Уникализация 2–5 (микро-кроп)» lives in
+        # the Export tab and instead makes the rendered pixels of each segment unique.
         s._inner.addWidget(self.chk_unique)
 
         row2 = QHBoxLayout()
@@ -4171,7 +4216,7 @@ class BatchCard(SidebarCard):
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
-        extra = " · уникальные 2-5" if self.chk_unique.isChecked() else ""
+        extra = " · без повторов 2-5" if self.chk_unique.isChecked() else ""
         self.count_info.setText(
             f"В папках: {', '.join(parts)} → будет {info['total']} видео "
             f"[{mode_txt}{extra}]")
@@ -4595,6 +4640,7 @@ class BuildWorker(QThread):
                 blur_fill=exp.get("blur_fill", False),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                 no_speedup=exp.get("no_speedup", False),
+                unique_2_5=exp.get("unique_2_5", False),
                 random_flags=rand_flags, preset_indices=rand_idx,
                 progress_cb=cb)
             if not ok:
@@ -4605,6 +4651,7 @@ class BuildWorker(QThread):
                     resolution=canvas, fps=exp["fps"],
                     with_audio=exp["audio"], uppercase=exp["uppercase"],
                     no_speedup=exp.get("no_speedup", False),
+                    unique_2_5=exp.get("unique_2_5", False),
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok2:
                     self.failed.emit(f"Ошибка: {err}\nMoviePy: {err2}")
@@ -4783,6 +4830,7 @@ class BatchBuildWorker(QThread):
                     blur_fill=exp.get("blur_fill", False),
                     audio_kbps=akbps,
                     no_speedup=exp.get("no_speedup", False),
+                    unique_2_5=exp.get("unique_2_5", False),
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
