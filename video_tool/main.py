@@ -364,6 +364,7 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             b["mode"] = _to_int(b.get("mode"), 0)
             b["count"] = max(0, min(10000, _to_int(b.get("count"), 0)))
             b["threads"] = max(1, min(8, _to_int(b.get("threads"), 3)))
+            b["unique"] = bool(b.get("unique", False))
     except Exception:
         pass
     try:
@@ -4170,8 +4171,10 @@ class BatchCard(SidebarCard):
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
+        extra = " · уникальные 2-5" if self.chk_unique.isChecked() else ""
         self.count_info.setText(
-            f"В папках: {', '.join(parts)} → будет {info['total']} видео [{mode_txt}]")
+            f"В папках: {', '.join(parts)} → будет {info['total']} видео "
+            f"[{mode_txt}{extra}]")
         # next batch preview
         if self.main:
             nxt = self.main.peek_next_batch(info["chars"])
