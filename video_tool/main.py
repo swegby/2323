@@ -371,6 +371,7 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(e, dict):
             e["resolution_index"] = _to_int(e.get("resolution_index"), 0)
             e["fps"] = _to_int(e.get("fps"), 30)
+            e["no_speedup"] = bool(e.get("no_speedup", False))
     except Exception:
         pass
     try:
@@ -1139,6 +1140,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
                          audio_kbps: int = 192,
+                         no_speedup_first: bool = False,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
@@ -1171,7 +1173,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         # otherwise the container gets padded to the longer audio
         silent_dur = target_dur if is_first else min(orig_dur, target_dur)
 
-        if is_first and orig_dur > target_dur:
+        if is_first and orig_dur > target_dur and not no_speedup_first:
             # ---------- SPEED UP (first segment too long) ----------
             speed_factor = orig_dur / target_dur
             cmd += ["-i", input_video]
@@ -1317,6 +1319,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            ten_bit: bool = False,
                            blur_fill: bool = False,
                            audio_kbps: int = 192,
+                           no_speedup: bool = False,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
                            progress_cb=None) -> Tuple[bool, str]:
@@ -1362,6 +1365,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                no_speedup_first=no_speedup,
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -1672,6 +1676,7 @@ def run_moviepy(video_paths: List[str],
                 resolution: Tuple[int, int] = (1080, 1920),
                 fps: int = 30, with_audio: bool = True,
                 uppercase: bool = False,
+                no_speedup: bool = False,
                 random_flags: Optional[List[bool]] = None,
                 preset_indices: Optional[List[int]] = None,
                 progress_cb=None) -> Tuple[bool, str]:
@@ -1713,7 +1718,7 @@ def run_moviepy(video_paths: List[str],
                     clip = _call_any(clip, ("cropped", "crop"),
                                      x1=x_crop, x2=x_crop + canvas_w)
                 clip = _call_any(clip, ("resized", "resize"), (canvas_w, canvas_h))
-                if i == 0 and clip.duration > target_durs[0]:
+                if i == 0 and clip.duration > target_durs[0] and not no_speedup:
                     clip = _call_any(clip, ("with_speed_scaled", "with_speed", "speedx"),
                                      clip.duration / target_durs[0])
                 if clip.duration > target_durs[i]:
@@ -3554,11 +3559,17 @@ class ExportCard(SidebarCard):
                                  "размытой копией вместо жёсткого кропа — контент не теряется.")
         self.chk_econ = QCheckBox("Эконом (без превью)")
         self.chk_econ.setToolTip("Не грузить видео в превью — экономия RAM при 1000+ видео")
+        self.chk_nospeed = QCheckBox("Не ускорять хук (обрезать)")
+        self.chk_nospeed.setToolTip(
+            "По умолчанию 1-е видео (хук), если оно длиннее нужной длительности, "
+            "ускоряется. С этой галкой хук НЕ ускоряется, а обрезается с конца — "
+            "как сегменты 2–5 (остаётся его естественная скорость).")
         s2._inner.addWidget(self.chk_audio)
         s2._inner.addWidget(self.chk_caps)
         s2._inner.addWidget(self.chk_tenbit)
         s2._inner.addWidget(self.chk_blur)
         s2._inner.addWidget(self.chk_econ)
+        s2._inner.addWidget(self.chk_nospeed)
 
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
@@ -3575,7 +3586,7 @@ class ExportCard(SidebarCard):
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_nospeed):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
                 else w.toggled.connect(self._changed)
 
@@ -3596,6 +3607,7 @@ class ExportCard(SidebarCard):
             "ten_bit": self.chk_tenbit.isChecked(),
             "blur_fill": self.chk_blur.isChecked(),
             "econ": self.chk_econ.isChecked(),
+            "no_speedup": self.chk_nospeed.isChecked(),
             "crf": q["crf"],
             "preset": q["preset"],
             "quality_text": q["label"],
@@ -3606,7 +3618,7 @@ class ExportCard(SidebarCard):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_nospeed):
             w.blockSignals(True)
         if "resolution_index" in cfg:
             self.res_combo.setCurrentIndex(
@@ -3631,9 +3643,10 @@ class ExportCard(SidebarCard):
         if "ten_bit" in cfg: self.chk_tenbit.setChecked(bool(cfg["ten_bit"]))
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
+        if "no_speedup" in cfg: self.chk_nospeed.setChecked(bool(cfg["no_speedup"]))
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_nospeed):
             w.blockSignals(False)
 
 # ======================================================================
@@ -4044,6 +4057,12 @@ class BatchCard(SidebarCard):
         row1.addStretch(1)
         s._inner.addLayout(row1)
 
+        self.chk_unique = QCheckBox("Уникальные 2–5 (без повторов)")
+        self.chk_unique.setToolTip(
+            "Каждое видео из folder_2…folder_5 используется в батче только один раз. "
+            "Файлы при этом НЕ удаляются — просто одно и то же видео не берётся повторно.")
+        s._inner.addWidget(self.chk_unique)
+
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Сколько:"))
         self.count_spin = QSpinBox()
@@ -4078,7 +4097,7 @@ class BatchCard(SidebarCard):
         self.layout().addWidget(hint)
 
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_unique, self.count_spin, self.threads_spin):
             if isinstance(w, QComboBox):
                 w.currentIndexChanged.connect(self._changed)
             elif isinstance(w, QCheckBox):
@@ -4095,6 +4114,7 @@ class BatchCard(SidebarCard):
             "mode": self.mode_combo.currentIndex(),          # 0 seq, 1 random
             "delete": self.chk_delete.isChecked(),
             "move": self.chk_move.isChecked(),
+            "unique": self.chk_unique.isChecked(),
             "count": self.count_spin.value(),
             "threads": self.threads_spin.value(),
         }
@@ -4103,19 +4123,20 @@ class BatchCard(SidebarCard):
         if not isinstance(cfg, dict):
             cfg = {}
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_unique, self.count_spin, self.threads_spin):
             w.blockSignals(True)
         if "enabled" in cfg: self.chk_enable.setChecked(bool(cfg["enabled"]))
         if "mode" in cfg:
             self.mode_combo.setCurrentIndex(_combo_index(self.mode_combo, cfg["mode"], 0))
         if "delete" in cfg: self.chk_delete.setChecked(bool(cfg["delete"]))
         if "move" in cfg: self.chk_move.setChecked(bool(cfg["move"]))
+        if "unique" in cfg: self.chk_unique.setChecked(bool(cfg["unique"]))
         if "count" in cfg:
             self.count_spin.setValue(max(0, min(10000, _to_int(cfg["count"], 0))))
         if "threads" in cfg:
             self.threads_spin.setValue(max(1, min(8, _to_int(cfg["threads"], 3))))
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_unique, self.count_spin, self.threads_spin):
             w.blockSignals(False)
 
     def compute_batch_info(self) -> Dict[str, Any]:
@@ -4135,7 +4156,13 @@ class BatchCard(SidebarCard):
             info["chars"].append((name, n, m))
             total += m
         cnt = self.count_spin.value()
-        info["total"] = min(total, cnt) if cnt > 0 else total
+        if cnt > 0:
+            total = min(total, cnt)
+        # with "unique 2-5" each build consumes one video from EVERY folder_2..5,
+        # so the batch cannot exceed the smallest folder's size
+        if self.chk_unique.isChecked() and others_len:
+            total = min(total, min(others_len))
+        info["total"] = total
         return info
 
     def update_info(self):
@@ -4564,6 +4591,7 @@ class BuildWorker(QThread):
                 ten_bit=exp.get("ten_bit", False),
                 blur_fill=exp.get("blur_fill", False),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
+                no_speedup=exp.get("no_speedup", False),
                 random_flags=rand_flags, preset_indices=rand_idx,
                 progress_cb=cb)
             if not ok:
@@ -4573,6 +4601,7 @@ class BuildWorker(QThread):
                     video_paths, presets, durs, out_path,
                     resolution=canvas, fps=exp["fps"],
                     with_audio=exp["audio"], uppercase=exp["uppercase"],
+                    no_speedup=exp.get("no_speedup", False),
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok2:
                     self.failed.emit(f"Ошибка: {err}\nMoviePy: {err2}")
@@ -4660,6 +4689,11 @@ class BatchBuildWorker(QThread):
             cnt = bcfg["count"]
             if cnt > 0:
                 tasks = tasks[:cnt]
+            # "unique 2-5": every build takes one video from EACH folder_2..5,
+            # so the whole batch is capped by the smallest folder's size
+            if bcfg["unique"]:
+                cap = min((len(v) for v in others), default=0)
+                tasks = tasks[:cap]
             total = len(tasks)
             if total == 0:
                 self.failed.emit("Нечего собирать — 0 задач.")
@@ -4670,6 +4704,7 @@ class BatchBuildWorker(QThread):
             # ---------- helpers ----------
             pools = [list(v) for v in others]
             pools_lock = threading.Lock()
+            used_videos: set = set()      # no-repeat pool for "unique 2-5"
             chars_cfg = self.main.characters_card.chars
             bot_token = str(chars_cfg.get("bot_token", "") or "")
             auto_send = bool(chars_cfg.get("auto_send", False))
@@ -4680,22 +4715,27 @@ class BatchBuildWorker(QThread):
                 paths = [folder1_vid]
                 for pi in range(4):
                     pool = pools[pi]
-                    if mode == 0:
-                        with pools_lock:
-                            if not pool:
+                    with pools_lock:
+                        if not pool:
+                            return None
+                        if bcfg["unique"]:
+                            avail = [v for v in pool if v not in used_videos]
+                            if not avail:
                                 return None
-                            v = pool[vid_idx % len(pool)]
-                            if bcfg["delete"] or bcfg["move"]:
-                                pool.remove(v)
-                        paths.append(v)
-                    else:
-                        with pools_lock:
-                            if not pool:
-                                return None
-                            v = random.choice(pool)
-                            if bcfg["delete"] or bcfg["move"]:
-                                pool.remove(v)
-                        paths.append(v)
+                            if mode == 0:
+                                preferred = pool[vid_idx % len(pool)]
+                                v = preferred if preferred in avail else avail[0]
+                            else:
+                                v = random.choice(avail)
+                            used_videos.add(v)
+                        else:
+                            if mode == 0:
+                                v = pool[vid_idx % len(pool)]
+                            else:
+                                v = random.choice(pool)
+                        if bcfg["delete"] or bcfg["move"]:
+                            pool.remove(v)
+                    paths.append(v)
                 return paths
 
             def handle_used(video_paths: List[str]):
@@ -4739,6 +4779,7 @@ class BatchBuildWorker(QThread):
                     ten_bit=exp.get("ten_bit", False),
                     blur_fill=exp.get("blur_fill", False),
                     audio_kbps=akbps,
+                    no_speedup=exp.get("no_speedup", False),
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
