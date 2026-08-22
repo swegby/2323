@@ -257,6 +257,52 @@ def list_music(folder: str = "") -> List[str]:
     return sorted(out, key=natural_key)
 
 
+def plan_batch_tasks(char_counts: List[Tuple[str, str, int]],
+                     others_len: List[int],
+                     mode: int = 0, count: int = 0,
+                     reuse: bool = True,
+                     consumes: bool = False) -> Tuple[List[Tuple[str, str, int]], int, int]:
+    """Спланировать задачи батча.
+
+    char_counts — [(folder, name, кол-во видео в folder_1 персонажа)].
+    others_len  — количество видео в folder_2…folder_5.
+    Возвращает (tasks, base, reused):
+      base   — сколько роликов можно собрать на уникальных исходниках;
+      reused — сколько задач добрано повтором исходников.
+    Если запрошено больше, чем есть материала, и reuse включён (и исходники не
+    удаляются/не переносятся) — исходники берутся по кругу заново.
+    """
+    tasks: List[Tuple[str, str, int]] = []
+    per_char: List[Tuple[str, str, int]] = []      # folder, name, m
+    for path, name, n in char_counts:
+        if mode == 0:
+            m = min([n] + list(others_len or [0]))
+        else:
+            m = n
+        m = max(0, m)
+        per_char.append((path, name, m))
+        for i in range(m):
+            tasks.append((path, name, i))
+
+    base = len(tasks)
+    reused = 0
+    allow_reuse = bool(reuse) and not bool(consumes)
+    if count > 0 and count <= base:
+        tasks = tasks[:count]
+    elif count > base and allow_reuse:
+        active = [(p, nm) for p, nm, _m in per_char
+                  if dict((c[1], c[2]) for c in char_counts).get(nm, 0) > 0]
+        next_idx = {nm: m for _p, nm, m in per_char}
+        k = 0
+        while len(tasks) < count and active:
+            p, nm = active[k % len(active)]
+            tasks.append((p, nm, next_idx.get(nm, 0)))
+            next_idx[nm] = next_idx.get(nm, 0) + 1
+            reused += 1
+            k += 1
+    return tasks, base, reused
+
+
 DEFAULT_MUSIC: Dict[str, Any] = {
     "enabled": False,
     "mode": 0,            # 0 = микс с оригиналом, 1 = заменить звук
@@ -415,6 +461,7 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             b["mode"] = _to_int(b.get("mode"), 0)
             b["count"] = max(0, min(10000, _to_int(b.get("count"), 0)))
             b["threads"] = max(1, min(8, _to_int(b.get("threads"), 3)))
+            b["reuse"] = bool(b.get("reuse", True))
     except Exception:
         pass
     try:
@@ -4604,6 +4651,15 @@ class BatchCard(SidebarCard):
         self.mode_combo.setMinimumContentsLength(12)
         s._inner.addWidget(self.mode_combo)
 
+        self.chk_reuse = QCheckBox("Повторять исходники (делать сколько прошу)")
+        self.chk_reuse.setChecked(True)
+        self.chk_reuse.setToolTip(
+            "Если запрошено больше роликов, чем есть комбинаций исходников — "
+            "видео берутся по кругу заново. Уникализатор всё равно делает каждый "
+            "ролик разным (другой кроп, цвет, шум, тайминги, звук, метаданные).\n"
+            "Не работает вместе с «Удалять 2–5» / «В used» — там исходники исчезают.")
+        s._inner.addWidget(self.chk_reuse)
+
         row1 = QHBoxLayout()
         self.chk_delete = QCheckBox("Удалять 2–5")
         self.chk_move = QCheckBox("В used")
@@ -4647,7 +4703,7 @@ class BatchCard(SidebarCard):
         self.layout().addWidget(hint)
 
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_reuse, self.count_spin, self.threads_spin):
             if isinstance(w, QComboBox):
                 w.currentIndexChanged.connect(self._changed)
             elif isinstance(w, QCheckBox):
@@ -4666,13 +4722,14 @@ class BatchCard(SidebarCard):
             "move": self.chk_move.isChecked(),
             "count": self.count_spin.value(),
             "threads": self.threads_spin.value(),
+            "reuse": self.chk_reuse.isChecked(),
         }
 
     def set_batch_config(self, cfg: Dict[str, Any]):
         if not isinstance(cfg, dict):
             cfg = {}
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_reuse, self.count_spin, self.threads_spin):
             w.blockSignals(True)
         if "enabled" in cfg: self.chk_enable.setChecked(bool(cfg["enabled"]))
         if "mode" in cfg:
@@ -4683,37 +4740,60 @@ class BatchCard(SidebarCard):
             self.count_spin.setValue(max(0, min(10000, _to_int(cfg["count"], 0))))
         if "threads" in cfg:
             self.threads_spin.setValue(max(1, min(8, _to_int(cfg["threads"], 3))))
+        self.chk_reuse.setChecked(bool(cfg.get("reuse", True)))
         for w in (self.chk_enable, self.mode_combo, self.chk_delete, self.chk_move,
-                  self.count_spin, self.threads_spin):
+                  self.chk_reuse, self.count_spin, self.threads_spin):
             w.blockSignals(False)
 
     def compute_batch_info(self) -> Dict[str, Any]:
         """Counts + expected total for current selection."""
         char_folders = (self.main.characters_card.get_filtered_character_folders()
                         if self.main else list_character_folders())
-        others = [list_videos(d) for d in FOLDER_DIRS[1:]]
-        others_len = [len(v) for v in others]
+        others_len = [len(list_videos(d)) for d in FOLDER_DIRS[1:]]
         mode = self.mode_combo.currentIndex()
-        info = {"chars": [], "total": 0, "mode": mode, "others": others_len}
-        total = 0
-        for path, name, n in char_folders:
-            if mode == 0:
-                m = min([n] + others_len)
-            else:
-                m = n
-            info["chars"].append((name, n, m))
-            total += m
         cnt = self.count_spin.value()
-        info["total"] = min(total, cnt) if cnt > 0 else total
-        return info
+        consumes = self.chk_delete.isChecked() or self.chk_move.isChecked()
+        reuse = self.chk_reuse.isChecked()
+        char_counts = [(p, nm, n) for p, nm, n in char_folders]
+        tasks, base, reused = plan_batch_tasks(
+            char_counts, others_len, mode=mode, count=cnt,
+            reuse=reuse, consumes=consumes)
+        per_char: List[Tuple[str, int, int]] = []
+        for p, nm, n in char_counts:
+            m = min([n] + others_len) if mode == 0 else n
+            per_char.append((nm, n, max(0, m)))
+        return {
+            "chars": per_char,
+            "others": others_len,
+            "mode": mode,
+            "base": base,
+            "reused": reused,
+            "requested": cnt,
+            "reuse": reuse and not consumes,
+            "consumes": consumes,
+            "total": len(tasks),
+        }
 
     def update_info(self):
         info = self.compute_batch_info()
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
-        self.count_info.setText(
-            f"В папках: {', '.join(parts)} → будет {info['total']} видео [{mode_txt}]")
+        base, req, total = info["base"], info["requested"], info["total"]
+        txt = f"В папках: {', '.join(parts)} → будет {total} видео [{mode_txt}]"
+        if req > base and info["reuse"]:
+            txt += (f"\nУникальных комбинаций исходников: {base}, "
+                    f"остальные {req - base} — повтор исходников "
+                    f"(уникализатор делает их разными).")
+        elif req > base and info["consumes"]:
+            txt += (f"\n⚠️ Просишь {req}, но материала хватает на {base}: "
+                    f"включены «Удалять 2–5»/«В used» — исходники расходуются, "
+                    f"повтор невозможен. Выключи их или добавь видео.")
+        elif req > base:
+            txt += (f"\n⚠️ Просишь {req}, а комбинаций всего {base}. "
+                    f"Включи «Повторять исходники» или добавь видео "
+                    f"в folder_1…folder_5.")
+        self.count_info.setText(txt)
         # next batch preview
         if self.main:
             nxt = self.main.peek_next_batch(info["chars"])
@@ -5015,25 +5095,27 @@ class BatchBuildWorker(QThread):
                 return
 
             # ---------- build task list ----------
-            tasks: List[Tuple[str, str, int]] = []   # (char_folder, char_name, vid_idx)
             mode = bcfg["mode"]
-            for path, name, n in char_folders:
-                cv = list_videos(path)
-                if mode == 0:
-                    m = min(len(cv), *[len(v) for v in others])
-                else:
-                    m = len(cv)
-                for i in range(m):
-                    tasks.append((path, name, i))
-            cnt = bcfg["count"]
-            if cnt > 0:
-                tasks = tasks[:cnt]
+            char_counts = [(path, name, len(list_videos(path)))
+                           for path, name, _n in char_folders]
+            consumes = bool(bcfg.get("delete") or bcfg.get("move"))
+            reuse = bool(bcfg.get("reuse", True))
+            cnt = _to_int(bcfg.get("count"), 0)
+            tasks, base, reused = plan_batch_tasks(
+                char_counts, [len(v) for v in others], mode=mode, count=cnt,
+                reuse=reuse, consumes=consumes)
             total = len(tasks)
             if total == 0:
                 self.failed.emit("Нечего собирать — 0 задач.")
                 return
 
-            self.progress.emit(1, f"Батч: {total} видео, потоков {bcfg['threads']}")
+            msg = f"Батч: {total} видео, потоков {bcfg['threads']}"
+            if reused:
+                msg += f" (из них {reused} с повтором исходников)"
+            elif cnt > base:
+                msg += (f" — просили {cnt}, но материала хватает только на {base}"
+                        + (" (включены Удалять/В used)" if consumes else ""))
+            self.progress.emit(1, msg)
 
             # ---------- helpers ----------
             pools = [list(v) for v in others]
@@ -5085,9 +5167,9 @@ class BatchBuildWorker(QThread):
             def build_task(task: Tuple[str, str, int]) -> Optional[str]:
                 char_folder, char_name, vid_idx = task
                 cv = list_videos(char_folder)
-                if vid_idx >= len(cv):
+                if not cv:
                     return None
-                f1 = cv[vid_idx]
+                f1 = cv[vid_idx % len(cv)]     # по кругу, если роликов просят больше
                 vp = pick_videos(f1, char_name, vid_idx)
                 if not vp:
                     return None
