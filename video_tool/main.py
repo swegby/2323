@@ -75,6 +75,7 @@ FOLDER_DIRS = [os.path.join(BASE_DIR, f) for f in FOLDERS]
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 USED_DIR = os.path.join(OUTPUT_DIR, "used")
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+MUSIC_DIR = os.path.join(BASE_DIR, "music")
 FONT_ANTON = os.path.join(FONTS_DIR, "Anton-Regular.ttf")
 FONT_OSWALD = os.path.join(FONTS_DIR, "Oswald-Bold.ttf")
 PROJECT_JSON = os.path.join(BASE_DIR, "project.json")
@@ -212,7 +213,7 @@ UNIQ_APPS = ["CapCut", "InShot", "VN", "Instagram", "Photos 6.1", "Splice",
 # ======================================================================
 
 def ensure_dirs() -> None:
-    for d in FOLDER_DIRS + [OUTPUT_DIR, USED_DIR, FONTS_DIR]:
+    for d in FOLDER_DIRS + [OUTPUT_DIR, USED_DIR, FONTS_DIR, MUSIC_DIR]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -235,6 +236,37 @@ def list_videos(folder: str) -> List[str]:
     except OSError:
         return []
     return sorted(out, key=natural_key)
+
+
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma", ".aiff"}
+
+
+def list_music(folder: str = "") -> List[str]:
+    """Все аудио-треки в папке music/ (включая подпапки), натуральная сортировка."""
+    folder = folder or MUSIC_DIR
+    if not folder or not os.path.isdir(folder):
+        return []
+    out: List[str] = []
+    try:
+        for root, _dirs, files in os.walk(folder):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in AUDIO_EXTS:
+                    out.append(os.path.join(root, fn))
+    except OSError:
+        return []
+    return sorted(out, key=natural_key)
+
+
+DEFAULT_MUSIC: Dict[str, Any] = {
+    "enabled": False,
+    "mode": 0,            # 0 = микс с оригиналом, 1 = заменить звук
+    "gain_db": -14,       # громкость музыки
+    "orig_db": 0,         # громкость оригинального звука при миксе
+    "random_track": True, # случайный трек на каждый ролик
+    "random_start": True, # случайная точка старта в треке (уникализация)
+    "fade": True,         # фейд-ин/аут 0.6 с
+    "folder": "",         # пусто = music/
+}
 
 
 def open_folder(path: str) -> None:
@@ -383,6 +415,15 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             b["mode"] = _to_int(b.get("mode"), 0)
             b["count"] = max(0, min(10000, _to_int(b.get("count"), 0)))
             b["threads"] = max(1, min(8, _to_int(b.get("threads"), 3)))
+    except Exception:
+        pass
+    try:
+        m = data.get("music")
+        if isinstance(m, dict):
+            m["enabled"] = bool(m.get("enabled", False))
+            m["mode"] = max(0, min(1, _to_int(m.get("mode"), 0)))
+            m["gain_db"] = max(-40, min(6, _to_int(m.get("gain_db"), -14)))
+            m["orig_db"] = max(-40, min(6, _to_int(m.get("orig_db"), 0)))
     except Exception:
         pass
     try:
@@ -1585,6 +1626,84 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
 
 
 # ======================================================================
+#  BACKGROUND MUSIC
+# ======================================================================
+
+def pick_music_track(cfg: Dict[str, Any], counter: int = 0) -> str:
+    """Выбрать трек: случайный или по кругу."""
+    tracks = list_music(cfg.get("folder") or "")
+    if not tracks:
+        return ""
+    if cfg.get("random_track", True):
+        return random.choice(tracks)
+    return tracks[counter % len(tracks)]
+
+
+def add_background_music(video_path: str, music_path: str, ffmpeg_exe: str,
+                         mode: int = 0, gain_db: float = -14.0,
+                         orig_db: float = 0.0, random_start: bool = True,
+                         fade: bool = True, audio_kbps: int = 192,
+                         has_audio: bool = True) -> Tuple[bool, str]:
+    """Подложить музыку под готовый ролик (видео копируется без пережатия).
+
+    mode 0 — микс с оригинальным звуком, mode 1 — полностью заменить звук.
+    random_start — случайная точка входа в треке (ещё один слой уникализации).
+    """
+    if not music_path or not os.path.isfile(music_path):
+        return False, "трек не найден"
+    try:
+        vdur = get_video_duration(video_path, ffmpeg_exe)
+        if vdur <= 0.05:
+            return False, "не удалось определить длительность видео"
+        mdur = get_video_duration(music_path, ffmpeg_exe)
+        start = 0.0
+        if random_start and mdur > vdur + 1.0:
+            start = random.uniform(0.0, max(0.0, mdur - vdur - 0.5))
+
+        tmp_out = os.path.splitext(video_path)[0] + f"_mus_{uuid.uuid4().hex[:6]}.mp4"
+        cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", video_path]
+        if start > 0.01:
+            cmd += ["-ss", f"{start:.3f}"]
+        cmd += ["-stream_loop", "-1", "-i", music_path]
+
+        fd = 0.6 if fade else 0.0
+        mchain = [f"volume={float(gain_db):.2f}dB",
+                  f"atrim=0:{vdur:.3f}", "asetpts=N/SR/TB",
+                  "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"]
+        if fd > 0 and vdur > 2 * fd:
+            mchain.append(f"afade=t=in:st=0:d={fd:.2f}")
+            mchain.append(f"afade=t=out:st={max(0.0, vdur - fd):.3f}:d={fd:.2f}")
+        fc = "[1:a]" + ",".join(mchain) + "[mus]"
+
+        use_mix = (int(mode) == 0) and has_audio and video_has_audio(video_path, ffmpeg_exe)
+        if use_mix:
+            fc += (f";[0:a]volume={float(orig_db):.2f}dB,"
+                   f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[org]"
+                   f";[org][mus]amix=inputs=2:duration=first:dropout_transition=0:"
+                   f"normalize=0[aout]")
+        else:
+            fc += ";[mus]anull[aout]"
+
+        cmd += ["-filter_complex", fc,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+                "-ar", "44100", "-ac", "2", "-shortest",
+                "-map_metadata", "0", "-movflags", "+faststart", tmp_out]
+        r = subprocess.run(cmd, capture_output=True, timeout=900)
+        if r.returncode != 0 or not os.path.isfile(tmp_out) or os.path.getsize(tmp_out) < 1024:
+            try:
+                os.remove(tmp_out)
+            except Exception:
+                pass
+            return False, r.stderr.decode("utf-8", "replace")[-800:]
+        os.replace(tmp_out, video_path)
+        return True, os.path.basename(music_path)
+    except Exception as e:
+        return False, str(e)
+
+
+# ======================================================================
 #  ONE FINAL VIDEO — 5 parallel segments → concat
 # ======================================================================
 
@@ -1604,6 +1723,8 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
                            uniq_cfg: Optional[Dict[str, Any]] = None,
+                           music_cfg: Optional[Dict[str, Any]] = None,
+                           music_counter: int = 0,
                            progress_cb=None) -> Tuple[bool, str]:
     """Full pipeline: render 5 segments in parallel, concat, cleanup.
 
@@ -1707,6 +1828,24 @@ def build_one_final_ffmpeg(video_paths: List[str],
                                 meta_args=uniq_metadata_args(uplan))
         if not ok:
             return False, err
+        if progress_cb:
+            progress_cb(90)
+        # ---------- фоновая музыка ----------
+        if music_cfg and music_cfg.get("enabled"):
+            track = pick_music_track(music_cfg, music_counter)
+            if track:
+                mok, minfo = add_background_music(
+                    out_path, track, ffmpeg_exe,
+                    mode=_to_int(music_cfg.get("mode"), 0),
+                    gain_db=_to_float(music_cfg.get("gain_db"), -14.0),
+                    orig_db=_to_float(music_cfg.get("orig_db"), 0.0),
+                    random_start=bool(music_cfg.get("random_start", True)),
+                    fade=bool(music_cfg.get("fade", True)),
+                    audio_kbps=audio_kbps, has_audio=with_audio)
+                if not mok:
+                    print(f"[music] не удалось наложить трек: {minfo}")
+            else:
+                print("[music] в папке music/ нет треков")
         if progress_cb:
             progress_cb(95)
         return True, ""
@@ -3694,6 +3833,79 @@ class ExportCard(SidebarCard):
         s2._inner.addWidget(self.chk_blur)
         s2._inner.addWidget(self.chk_econ)
 
+        # ---------------- Музыка ----------------
+        sm = self._add_section("Музыка (фон)")
+        self.chk_music = QCheckBox("Добавить фоновую музыку")
+        self.chk_music.setToolTip(
+            "Треки берутся из папки music/ (mp3, wav, m4a, aac, ogg, flac).\n"
+            "Музыка подкладывается под готовый ролик — видео не пережимается.")
+        sm._inner.addWidget(self.chk_music)
+
+        mrow = QHBoxLayout()
+        self.music_info = QLabel("music/ — 0 треков")
+        self.music_info.setObjectName("Info")
+        self.music_info.setToolTip(MUSIC_DIR)
+        mrow.addWidget(self.music_info, 1)
+        b_mus = QPushButton("Папка")
+        b_mus.setObjectName("SmallBtn")
+        b_mus.setToolTip("Открыть папку music")
+        b_mus.clicked.connect(lambda: (os.makedirs(MUSIC_DIR, exist_ok=True),
+                                       open_folder(MUSIC_DIR)))
+        mrow.addWidget(b_mus)
+        b_ref = QPushButton("Обновить")
+        b_ref.setObjectName("SmallBtn")
+        b_ref.clicked.connect(self.refresh_music_info)
+        mrow.addWidget(b_ref)
+        sm._inner.addLayout(mrow)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Режим"))
+        self.music_mode = QComboBox()
+        self.music_mode.addItems(["Микс с оригиналом", "Заменить звук"])
+        self.music_mode.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.music_mode.setMinimumContentsLength(10)
+        mode_row.addWidget(self.music_mode, 1)
+        sm._inner.addLayout(mode_row)
+
+        g1 = QHBoxLayout()
+        g1.addWidget(QLabel("Музыка"))
+        self.music_gain = QSpinBox()
+        self.music_gain.setRange(-40, 6)
+        self.music_gain.setValue(-14)
+        self.music_gain.setSuffix(" dB")
+        self.music_gain.setToolTip("Громкость музыки. -14 dB — фон под голос, "
+                                   "0 dB — вровень с оригиналом.")
+        g1.addWidget(self.music_gain)
+        g1.addWidget(QLabel("Оригинал"))
+        self.orig_gain = QSpinBox()
+        self.orig_gain.setRange(-40, 6)
+        self.orig_gain.setValue(0)
+        self.orig_gain.setSuffix(" dB")
+        self.orig_gain.setToolTip("Громкость исходного звука видео при миксе.")
+        g1.addWidget(self.orig_gain)
+        sm._inner.addLayout(g1)
+
+        self.chk_music_rand = QCheckBox("Случайный трек на каждый ролик")
+        self.chk_music_rand.setChecked(True)
+        self.chk_music_rand.setToolTip("Иначе треки идут по кругу по порядку.")
+        self.chk_music_start = QCheckBox("Случайная точка старта в треке")
+        self.chk_music_start.setChecked(True)
+        self.chk_music_start.setToolTip("Каждый ролик берёт свой кусок трека — "
+                                        "ещё один слой уникализации аудио.")
+        self.chk_music_fade = QCheckBox("Фейд-ин / фейд-аут 0.6 с")
+        self.chk_music_fade.setChecked(True)
+        sm._inner.addWidget(self.chk_music_rand)
+        sm._inner.addWidget(self.chk_music_start)
+        sm._inner.addWidget(self.chk_music_fade)
+
+        self.music_hint = QLabel("⚠️ Копирайтные треки Instagram ловит по аудио-"
+                                 "отпечатку даже после смены питча/скорости. "
+                                 "Клади свою музыку, Meta Sound Collection или royalty-free.")
+        self.music_hint.setObjectName("Hint")
+        self.music_hint.setWordWrap(True)
+        sm._inner.addWidget(self.music_hint)
+
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
         self.out_label = QLabel(truncate_middle(OUTPUT_DIR, 34))
@@ -3708,10 +3920,55 @@ class ExportCard(SidebarCard):
         s3._inner.addLayout(orow)
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.music_mode,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_music, self.chk_music_rand,
+                  self.chk_music_start, self.chk_music_fade):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
                 else w.toggled.connect(self._changed)
+        for sp in (self.music_gain, self.orig_gain):
+            sp.valueChanged.connect(self._changed)
+        self.refresh_music_info()
+
+    def refresh_music_info(self):
+        try:
+            tracks = list_music()
+            self.music_info.setText(f"music/ — {len(tracks)} треков")
+            self.music_info.setToolTip(
+                MUSIC_DIR + ("\n" + "\n".join(os.path.basename(t) for t in tracks[:12])
+                             if tracks else "\nПоложи сюда mp3/wav/m4a"))
+        except Exception:
+            pass
+
+    def get_music_config(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.chk_music.isChecked(),
+            "mode": self.music_mode.currentIndex(),
+            "gain_db": self.music_gain.value(),
+            "orig_db": self.orig_gain.value(),
+            "random_track": self.chk_music_rand.isChecked(),
+            "random_start": self.chk_music_start.isChecked(),
+            "fade": self.chk_music_fade.isChecked(),
+            "folder": "",
+        }
+
+    def set_music_config(self, cfg: Dict[str, Any]):
+        if not isinstance(cfg, dict):
+            cfg = {}
+        ws = [self.chk_music, self.music_mode, self.music_gain, self.orig_gain,
+              self.chk_music_rand, self.chk_music_start, self.chk_music_fade]
+        for w in ws:
+            w.blockSignals(True)
+        self.chk_music.setChecked(bool(cfg.get("enabled", False)))
+        self.music_mode.setCurrentIndex(max(0, min(1, _to_int(cfg.get("mode"), 0))))
+        self.music_gain.setValue(max(-40, min(6, _to_int(cfg.get("gain_db"), -14))))
+        self.orig_gain.setValue(max(-40, min(6, _to_int(cfg.get("orig_db"), 0))))
+        self.chk_music_rand.setChecked(bool(cfg.get("random_track", True)))
+        self.chk_music_start.setChecked(bool(cfg.get("random_start", True)))
+        self.chk_music_fade.setChecked(bool(cfg.get("fade", True)))
+        for w in ws:
+            w.blockSignals(False)
+        self.refresh_music_info()
 
     def _changed(self, _=None):
         self.configChanged.emit()
@@ -4658,6 +4915,8 @@ class BuildWorker(QThread):
             rand_idx = [c.current_idx for c in self.main.cards]
             exp = self.main.export_card.get_export_config()
             uniq_cfg = self.main.uniq_card.get_uniq_config()
+            music_cfg = self.main.export_card.get_music_config()
+            music_cfg = self.main.export_card.get_music_config()
             canvas = self._canvas_size(exp)
             self.progress.emit(5, "Подготовка сегментов…")
 
@@ -4681,7 +4940,8 @@ class BuildWorker(QThread):
                 blur_fill=exp.get("blur_fill", False),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                 random_flags=rand_flags, preset_indices=rand_idx,
-                uniq_cfg=uniq_cfg,
+                uniq_cfg=uniq_cfg, music_cfg=music_cfg,
+                music_counter=self.main.video_counter,
                 progress_cb=cb)
             if not ok:
                 # MoviePy fallback
@@ -4737,6 +4997,7 @@ class BatchBuildWorker(QThread):
                 return
             exp = self.main.export_card.get_export_config()
             uniq_cfg = self.main.uniq_card.get_uniq_config()
+            music_cfg = self.main.export_card.get_music_config()
             bcfg = self.main.batch_card.get_batch_config()
             canvas = self.main.build_worker_canvas(exp)
             presets = [c.presets for c in self.main.cards]
@@ -4850,7 +5111,8 @@ class BatchBuildWorker(QThread):
                     blur_fill=exp.get("blur_fill", False),
                     audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                     random_flags=rand_flags, preset_indices=rand_idx,
-                    uniq_cfg=uniq_cfg)
+                    uniq_cfg=uniq_cfg, music_cfg=music_cfg,
+                    music_counter=vid_idx)
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
                     return None
@@ -5153,6 +5415,7 @@ class MainWindow(QMainWindow):
         self.project = {
             "segments": [c.get_config() for c in self.cards],
             "export": self.export_card.get_export_config(),
+            "music": self.export_card.get_music_config(),
             "uniq": self.uniq_card.get_uniq_config(),
             "batch": self.batch_card.get_batch_config(),
             "ui": {
@@ -5177,6 +5440,10 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
             try:
                 self.export_card.set_export_config(self.project.get("export", {}))
+            except Exception:
+                traceback.print_exc()
+            try:
+                self.export_card.set_music_config(self.project.get("music", {}))
             except Exception:
                 traceback.print_exc()
             try:
