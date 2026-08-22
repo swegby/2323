@@ -1081,6 +1081,23 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
     )
 
 
+def _originality_prefix(enabled: bool, intensity: float = 0.55) -> str:
+    """Subtle editorial treatment; never flips or mirrors the source.
+
+    This is intentionally restrained: it improves an original edit with a
+    small color/noise fingerprint rather than trying to disguise reposts.
+    """
+    if not enabled:
+        return ""
+    level = max(0.0, min(1.0, float(intensity)))
+    contrast = 1.0 + 0.045 * level
+    saturation = 1.0 + 0.10 * level
+    brightness = 0.008 * level
+    noise = max(1, int(round(2 + 4 * level)))
+    return (f"eq=contrast={contrast:.4f}:brightness={brightness:.4f}:"
+            f"saturation={saturation:.4f},noise=alls={noise}:allf=t+u,")
+
+
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          target_dur: float, is_first: bool, orig_dur: float,
                          seg_out: str, ffmpeg_exe: str, crf: int = 18,
@@ -1089,6 +1106,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
                          audio_kbps: int = 192,
+                         originality: bool = True, originality_intensity: float = 0.55,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
@@ -1110,6 +1128,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         pix = "yuv420p10le" if use10 else "yuv420p"
 
         bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        editorial = _originality_prefix(originality, originality_intensity)
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
@@ -1125,7 +1144,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             # ---------- SPEED UP (first segment too long) ----------
             speed_factor = orig_dur / target_dur
             cmd += ["-i", input_video]
-            vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{bg_chain}")
+            vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{editorial}{bg_chain}")
             if has_audio:
                 vf.append(f"[0:a]{build_atempo(speed_factor)}[a]")
                 audio_idx = 0
@@ -1133,7 +1152,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             # ---------- LOOP (first segment too short) ----------
             loop = max(0, int(math.ceil(target_dur / orig_dur)) - 1)
             cmd += ["-stream_loop", str(loop), "-i", input_video]
-            vf.append(f"[0:v]{bg_chain}")
+            vf.append(f"[0:v]{editorial}{bg_chain}")
             if has_audio:
                 vf.append("[0:a]anull[a]")
                 audio_idx = 0
@@ -1145,7 +1164,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                 cmd += ["-ss", f"{ss:.3f}"]
                 trim_out = target_dur
             cmd += ["-i", input_video]
-            vf.append(f"[0:v]{bg_chain}")
+            vf.append(f"[0:v]{editorial}{bg_chain}")
             if has_audio:
                 vf.append("[0:a]anull[a]")
                 audio_idx = 0
@@ -1267,6 +1286,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            ten_bit: bool = False,
                            blur_fill: bool = False,
                            audio_kbps: int = 192,
+                           originality: bool = True, originality_intensity: float = 0.55,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
                            progress_cb=None) -> Tuple[bool, str]:
@@ -1312,6 +1332,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                originality=originality, originality_intensity=originality_intensity,
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -3331,6 +3352,18 @@ class ExportCard(SidebarCard):
         self.chk_blur = QCheckBox("Размытый фон вместо обрезки")
         self.chk_blur.setToolTip("Для горизонтальных/квадратных видео: заполнить экран "
                                  "размытой копией вместо жёсткого кропа — контент не теряется.")
+        self.chk_originality = QCheckBox("Авторский монтаж (без зеркала)")
+        self.chk_originality.setChecked(True)
+        self.chk_originality.setToolTip("Мягкая цветокоррекция и лёгкая плёночная текстура. Видео не отражается и не переворачивается.")
+        orig_row = QHBoxLayout()
+        orig_row.addWidget(QLabel("Интенсивность"))
+        self.originality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.originality_slider.setRange(0, 100)
+        self.originality_slider.setValue(55)
+        self.originality_slider.setToolTip("0 — выключено, 100 — заметнее; обычно достаточно 35–60")
+        orig_row.addWidget(self.originality_slider, 1)
+        s2._inner.addWidget(self.chk_originality)
+        s2._inner.addLayout(orig_row)
         self.chk_econ = QCheckBox("Эконом (без превью)")
         self.chk_econ.setToolTip("Не грузить видео в превью — экономия RAM при 1000+ видео")
         s2._inner.addWidget(self.chk_audio)
@@ -3354,9 +3387,9 @@ class ExportCard(SidebarCard):
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_originality, self.originality_slider, self.chk_econ):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
-                else w.toggled.connect(self._changed)
+                else (w.valueChanged.connect(self._changed) if isinstance(w, QSlider) else w.toggled.connect(self._changed))
 
     def _changed(self, _=None):
         self.configChanged.emit()
@@ -3374,6 +3407,8 @@ class ExportCard(SidebarCard):
             "uppercase": self.chk_caps.isChecked(),
             "ten_bit": self.chk_tenbit.isChecked(),
             "blur_fill": self.chk_blur.isChecked(),
+            "originality": self.chk_originality.isChecked(),
+            "originality_intensity": self.originality_slider.value() / 100.0,
             "econ": self.chk_econ.isChecked(),
             "crf": q["crf"],
             "preset": q["preset"],
@@ -3385,7 +3420,7 @@ class ExportCard(SidebarCard):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_originality, self.originality_slider, self.chk_econ):
             w.blockSignals(True)
         if "resolution_index" in cfg:
             self.res_combo.setCurrentIndex(
@@ -3409,10 +3444,13 @@ class ExportCard(SidebarCard):
         if "uppercase" in cfg: self.chk_caps.setChecked(bool(cfg["uppercase"]))
         if "ten_bit" in cfg: self.chk_tenbit.setChecked(bool(cfg["ten_bit"]))
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
+        if "originality" in cfg: self.chk_originality.setChecked(bool(cfg["originality"]))
+        if "originality_intensity" in cfg:
+            self.originality_slider.setValue(max(0, min(100, int(float(cfg["originality_intensity"]) * 100))))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_originality, self.originality_slider, self.chk_econ):
             w.blockSignals(False)
 
 # ======================================================================
@@ -4142,6 +4180,8 @@ class BuildWorker(QThread):
                 with_audio=exp["audio"], uppercase=exp["uppercase"],
                 ten_bit=exp.get("ten_bit", False),
                 blur_fill=exp.get("blur_fill", False),
+                originality=exp.get("originality", True),
+                originality_intensity=exp.get("originality_intensity", 0.55),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                 random_flags=rand_flags, preset_indices=rand_idx,
                 progress_cb=cb)
@@ -4306,6 +4346,8 @@ class BatchBuildWorker(QThread):
                     with_audio=exp["audio"], uppercase=exp["uppercase"],
                     ten_bit=exp.get("ten_bit", False),
                     blur_fill=exp.get("blur_fill", False),
+                    originality=exp.get("originality", True),
+                    originality_intensity=exp.get("originality_intensity", 0.55),
                     audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok:
