@@ -155,6 +155,57 @@ RESOLUTIONS = [
 FPS_CHOICES = [30, 24, 60]
 
 # ======================================================================
+#  UNIQUIFIER (уникализатор) — defaults
+# ======================================================================
+# Каждая опция меняет один из «слоёв» цифрового отпечатка ролика:
+# пиксели/геометрия, цвет, шум, звук, тайминг, контейнер/метаданные.
+DEFAULT_UNIQ: Dict[str, Any] = {
+    "enabled": True,
+    "skip_hook": True,        # сегмент 1 (folder_1 = хук) НЕ уникализируется
+    "strength": 1,            # 0 лёгкая / 1 средняя / 2 сильная
+    "flip": False,            # зеркало по горизонтали (ломает pHash сильнее всего)
+    "flip_prob": 50,          # % роликов, которые будут зеркалиться
+    "zoom": True,             # микро-зум 1–4 % + сдвиг кадра
+    "rotate": True,           # микро-поворот ±0.1–0.8°
+    "color": True,            # яркость / контраст / насыщенность / гамма / hue
+    "grain": True,            # плёночное зерно (ломает частотные паттерны)
+    "vignette": False,        # лёгкая виньетка
+    "sharpen": True,          # микро-резкость/размытие
+    "audio": True,            # питч ±, громкость, EQ (длительность сохраняется)
+    "audio_noise": False,     # неслышимый розовый шум в фоне
+    "dur_jitter": True,       # длительность сегментов ±3 %
+    "fps_jitter": False,      # FPS ±1 кадр
+    "metadata": True,         # стереть EXIF/метаданные, подставить новые
+    "encoder": True,          # CRF/GOP/профиль кодировщика «пляшут»
+    "rand_name": True,        # случайное имя файла
+}
+
+# диапазоны по уровню силы: (лёгкая, средняя, сильная)
+UNIQ_RANGES = {
+    "zoom":      [(1.008, 1.018), (1.015, 1.032), (1.03, 1.06)],
+    "shift":     [(0, 6),         (4, 14),        (10, 26)],
+    "rotate":    [(0.08, 0.25),   (0.2, 0.55),    (0.4, 0.9)],
+    "bright":    [(0.006, 0.018), (0.015, 0.035), (0.03, 0.06)],
+    "contrast":  [(0.010, 0.025), (0.02, 0.05),   (0.04, 0.09)],
+    "saturate":  [(0.010, 0.030), (0.025, 0.06),  (0.05, 0.11)],
+    "gamma":     [(0.008, 0.020), (0.015, 0.04),  (0.03, 0.07)],
+    "hue":       [(0.4, 1.5),     (1.0, 3.0),     (2.5, 6.0)],
+    "grain":     [(1.5, 4.0),     (3.0, 8.0),     (7.0, 14.0)],
+    "sharpen":   [(0.05, 0.20),   (0.15, 0.45),   (0.35, 0.80)],
+    "pitch":     [(0.002, 0.006), (0.005, 0.013), (0.012, 0.025)],
+    "volume":    [(0.2, 0.6),     (0.5, 1.2),     (1.0, 2.0)],
+    "dur":       [(0.010, 0.025), (0.02, 0.05),   (0.04, 0.09)],
+}
+
+UNIQ_DEVICES = [
+    ("Apple", "iPhone 15 Pro"), ("Apple", "iPhone 14"), ("Apple", "iPhone 13 mini"),
+    ("samsung", "SM-S918B"), ("samsung", "SM-A546E"), ("Xiaomi", "23078RKD5G"),
+    ("Google", "Pixel 8"), ("Google", "Pixel 7a"), ("OnePlus", "CPH2451"),
+]
+UNIQ_APPS = ["CapCut", "InShot", "VN", "Instagram", "Photos 6.1", "Splice",
+             "VideoLeap", "Adobe Premiere Rush"]
+
+# ======================================================================
 #  FILE SYSTEM HELPERS
 # ======================================================================
 
@@ -330,6 +381,16 @@ def sanitize_project(data: Dict[str, Any]) -> Dict[str, Any]:
             b["mode"] = _to_int(b.get("mode"), 0)
             b["count"] = max(0, min(10000, _to_int(b.get("count"), 0)))
             b["threads"] = max(1, min(8, _to_int(b.get("threads"), 3)))
+    except Exception:
+        pass
+    try:
+        u = data.get("uniq")
+        if isinstance(u, dict):
+            u["strength"] = max(0, min(2, _to_int(u.get("strength"), 1)))
+            u["flip_prob"] = max(0, min(100, _to_int(u.get("flip_prob"), 50)))
+            for k, v in DEFAULT_UNIQ.items():
+                if isinstance(v, bool):
+                    u[k] = bool(u.get(k, v))
     except Exception:
         pass
     try:
@@ -1081,6 +1142,179 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
     )
 
 
+# ======================================================================
+#  UNIQUIFIER — план уникализации + ffmpeg-фильтры
+# ======================================================================
+
+def _rng_range(cfg: Dict[str, Any], key: str) -> Tuple[float, float]:
+    lvl = max(0, min(2, _to_int(cfg.get("strength"), 1)))
+    return UNIQ_RANGES[key][lvl]
+
+
+def _sym(cfg: Dict[str, Any], key: str) -> float:
+    """Случайное значение из диапазона со случайным знаком."""
+    lo, hi = _rng_range(cfg, key)
+    v = random.uniform(lo, hi)
+    return v if random.random() < 0.5 else -v
+
+
+def make_uniq_plan(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Сгенерировать НОВЫЙ набор случайных параметров уникализации.
+
+    Вызывается один раз на каждое собираемое видео — все сегменты одного
+    ролика получают согласованный «отпечаток», но каждый следующий ролик
+    отличается от предыдущего.
+    """
+    if not cfg or not cfg.get("enabled", False):
+        return None
+    p: Dict[str, Any] = {"skip_hook": bool(cfg.get("skip_hook", True))}
+
+    if cfg.get("flip") and random.random() * 100 < _to_int(cfg.get("flip_prob"), 50):
+        p["hflip"] = True
+    if cfg.get("zoom"):
+        lo, hi = _rng_range(cfg, "zoom")
+        p["zoom"] = random.uniform(lo, hi)
+        slo, shi = _rng_range(cfg, "shift")
+        p["shift"] = (random.randint(int(-shi), int(shi)),
+                      random.randint(int(-shi), int(shi)))
+    if cfg.get("rotate"):
+        p["rotate"] = _sym(cfg, "rotate")
+    if cfg.get("color"):
+        p["bright"] = _sym(cfg, "bright")
+        p["contrast"] = 1.0 + _sym(cfg, "contrast")
+        p["saturate"] = 1.0 + _sym(cfg, "saturate")
+        p["gamma"] = 1.0 + _sym(cfg, "gamma")
+        p["hue"] = _sym(cfg, "hue")
+    if cfg.get("grain"):
+        lo, hi = _rng_range(cfg, "grain")
+        p["grain"] = random.uniform(lo, hi)
+    if cfg.get("vignette"):
+        p["vignette"] = random.uniform(0.06, 0.18)
+    if cfg.get("sharpen"):
+        p["sharpen"] = _sym(cfg, "sharpen")
+    if cfg.get("audio"):
+        p["pitch"] = 1.0 + _sym(cfg, "pitch")
+        p["volume"] = _sym(cfg, "volume")
+        p["eq_freq"] = random.choice([120, 400, 1200, 3500, 8000])
+        p["eq_gain"] = _sym(cfg, "volume")
+    if cfg.get("audio_noise"):
+        p["anoise"] = random.uniform(0.0015, 0.004)
+    if cfg.get("dur_jitter"):
+        lo, hi = _rng_range(cfg, "dur")
+        p["dur"] = [1.0 + (random.uniform(lo, hi) * (1 if random.random() < 0.5 else -1))
+                    for _ in range(5)]
+    if cfg.get("fps_jitter"):
+        p["fps_delta"] = random.choice([-1, 0, 1])
+    if cfg.get("encoder"):
+        p["crf_delta"] = random.choice([-1, 0, 0, 1])
+        p["gop"] = random.choice([48, 60, 72, 90, 120, 150, 250])
+        p["bframes"] = random.choice([2, 3, 4])
+    if cfg.get("metadata"):
+        brand, model = random.choice(UNIQ_DEVICES)
+        ts = time.time() - random.randint(3600, 60 * 24 * 3600)
+        p["meta"] = {
+            "brand": brand, "model": model,
+            "app": random.choice(UNIQ_APPS),
+            "creation_time": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z",
+                                           time.gmtime(ts)),
+            "uid": uuid.uuid4().hex.upper(),
+        }
+    return p
+
+
+def uniq_video_chain(plan: Optional[Dict[str, Any]], W: int, H: int) -> str:
+    """ffmpeg-цепочка фильтров изображения (без входных/выходных лейблов)."""
+    if not plan:
+        return ""
+    parts: List[str] = []
+    if plan.get("hflip"):
+        parts.append("hflip")
+
+    ang = float(plan.get("rotate", 0.0) or 0.0)
+    zoom = float(plan.get("zoom", 1.0) or 1.0)
+    dx, dy = plan.get("shift", (0, 0))
+    if abs(ang) > 0.001:
+        parts.append(f"rotate={math.radians(ang):.6f}:ow=iw:oh=ih:c=black@0")
+        # компенсируем чёрные уголки поворота дополнительным зумом
+        zoom = max(zoom, 1.0 + abs(math.radians(ang)) * 2.2 + 0.01)
+    if zoom > 1.0005 or dx or dy:
+        zw = max(W + 2, int(W * zoom)) // 2 * 2
+        zh = max(H + 2, int(H * zoom)) // 2 * 2
+        parts.append(f"scale={zw}:{zh}:flags=lanczos")
+        cx = max(0, min(zw - W, (zw - W) // 2 + int(dx)))
+        cy = max(0, min(zh - H, (zh - H) // 2 + int(dy)))
+        parts.append(f"crop={W}:{H}:{cx}:{cy}:exact=1")
+
+    eq = []
+    if "bright" in plan:
+        eq.append(f"brightness={plan['bright']:.4f}")
+        eq.append(f"contrast={plan['contrast']:.4f}")
+        eq.append(f"saturation={plan['saturate']:.4f}")
+        eq.append(f"gamma={plan['gamma']:.4f}")
+    if eq:
+        parts.append("eq=" + ":".join(eq))
+    if plan.get("hue"):
+        parts.append(f"hue=h={plan['hue']:.3f}")
+    sh = float(plan.get("sharpen", 0.0) or 0.0)
+    if abs(sh) > 0.01:
+        parts.append(f"unsharp=5:5:{sh:.3f}:5:5:0.0")
+    if plan.get("grain"):
+        parts.append(f"noise=alls={int(round(plan['grain']))}:allf=t+u")
+    if plan.get("vignette"):
+        parts.append(f"vignette=angle=PI/{max(4.0, 5.0 - plan['vignette'] * 8):.2f}")
+    if parts:
+        parts.append("setsar=1")
+    return ",".join(parts)
+
+
+def uniq_audio_chain(plan: Optional[Dict[str, Any]]) -> str:
+    """ffmpeg-цепочка фильтров звука. Длительность НЕ меняется."""
+    if not plan:
+        return ""
+    parts: List[str] = []
+    pitch = float(plan.get("pitch", 1.0) or 1.0)
+    if abs(pitch - 1.0) > 0.0005:
+        # сдвиг тона с компенсацией темпа -> длительность прежняя,
+        # но аудио-фингерпринт другой
+        parts.append(f"asetrate=44100*{pitch:.6f}")
+        parts.append("aresample=44100")
+        parts.append(build_atempo(1.0 / pitch) if pitch < 1.0
+                     else f"atempo={1.0 / pitch:.6f}")
+    if plan.get("eq_gain"):
+        parts.append(f"equalizer=f={plan['eq_freq']}:t=q:w=1.2:g={plan['eq_gain']:.3f}")
+    if plan.get("volume"):
+        parts.append(f"volume={plan['volume']:.3f}dB")
+    return ",".join(parts)
+
+
+def uniq_metadata_args(plan: Optional[Dict[str, Any]]) -> List[str]:
+    """Аргументы ffmpeg: снести старые метаданные и подставить свежие."""
+    if not plan or not plan.get("meta"):
+        return []
+    m = plan["meta"]
+    return [
+        "-map_metadata", "-1",
+        "-metadata", f"creation_time={m['creation_time']}",
+        "-metadata", f"com.apple.quicktime.make={m['brand']}",
+        "-metadata", f"com.apple.quicktime.model={m['model']}",
+        "-metadata", f"com.apple.quicktime.software={m['app']}",
+        "-metadata", f"make={m['brand']}",
+        "-metadata", f"model={m['model']}",
+        "-metadata", f"encoder={m['app']}",
+        "-metadata", f"comment={m['uid']}",
+        "-metadata", f"title={m['uid'][:12]}",
+    ]
+
+
+def uniq_apply_to_segment(plan: Optional[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
+    """План для конкретного сегмента: хук (index 0) можно не трогать."""
+    if not plan:
+        return None
+    if index == 0 and plan.get("skip_hook", True):
+        return None
+    return plan
+
+
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          target_dur: float, is_first: bool, orig_dur: float,
                          seg_out: str, ffmpeg_exe: str, crf: int = 18,
@@ -1089,6 +1323,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
                          audio_kbps: int = 192,
+                         uniq: Optional[Dict[str, Any]] = None,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
@@ -1110,6 +1345,12 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         pix = "yuv420p10le" if use10 else "yuv420p"
 
         bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        uf = uniq_video_chain(uniq, canvas_w, canvas_h)
+        if uf:
+            i_lbl = bg_chain.rfind("[bg]")
+            bg_chain = (bg_chain[:i_lbl] + "[bgu]" + bg_chain[i_lbl + 4:]
+                        + f";[bgu]{uf}[bg]")
+        ua = uniq_audio_chain(uniq)
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
@@ -1127,7 +1368,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-i", input_video]
             vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{bg_chain}")
             if has_audio:
-                vf.append(f"[0:a]{build_atempo(speed_factor)}[a]")
+                vf.append(f"[0:a]{build_atempo(speed_factor)}{(',' + ua) if ua else ''}[a0]")
                 audio_idx = 0
         elif is_first and orig_dur < target_dur:
             # ---------- LOOP (first segment too short) ----------
@@ -1135,7 +1376,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-stream_loop", str(loop), "-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{ua or 'anull'}[a0]")
                 audio_idx = 0
             trim_out = target_dur
         else:
@@ -1147,7 +1388,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{ua or 'anull'}[a0]")
                 audio_idx = 0
 
         # silent track when audio requested but source has none
@@ -1155,8 +1396,19 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             need_silent = True
             cmd += ["-f", "lavfi", "-t", f"{silent_dur:.3f}",
                     "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
-            vf.append("[1:a]anull[a]")
+            vf.append("[1:a]anull[a0]")
             audio_idx = 1
+
+        if audio_idx >= 0:
+            anoise = float((uniq or {}).get("anoise", 0.0) or 0.0)
+            if anoise > 0:
+                vf.append(f"anoisesrc=color=pink:amplitude={anoise:.5f}:"
+                          f"d={silent_dur + 1.0:.3f}:r=44100,"
+                          f"aformat=channel_layouts=stereo[anz]")
+                vf.append("[a0][anz]amix=inputs=2:duration=first:"
+                          "dropout_transition=0:normalize=0[a]")
+            else:
+                vf.append("[a0]anull[a]")
 
         png_idx = 2 if need_silent else 1
         cmd += ["-loop", "1", "-i", text_png]
@@ -1173,8 +1425,11 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-map", "[a]"]
         else:
             cmd += ["-an"]
-        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        u_crf = max(10, min(30, int(crf) + int((uniq or {}).get("crf_delta", 0) or 0)))
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(u_crf),
                 "-pix_fmt", pix, "-threads", "2"]
+        if uniq and uniq.get("gop"):
+            cmd += ["-g", str(int(uniq["gop"])), "-bf", str(int(uniq.get("bframes", 3)))]
         if use10:
             cmd += ["-profile:v", "high10", "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
         if audio_idx >= 0:
@@ -1199,7 +1454,8 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
 
 
 def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
-                  with_audio: bool = True) -> Tuple[bool, str]:
+                  with_audio: bool = True,
+                  meta_args: Optional[List[str]] = None) -> Tuple[bool, str]:
     """Instant concat via demuxer (-c copy). Fallback: re-encode concat."""
     if not seg_files:
         return False, "no segments"
@@ -1211,7 +1467,8 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
                 f.write("file '" + s.replace("\\", "/").replace("'", "'\\''") + "'\n")
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", tmp_list,
-               "-c", "copy", out_path]
+               "-c", "copy"] + list(meta_args or []) + [
+               "-movflags", "+faststart", out_path]
         r = subprocess.run(cmd, capture_output=True, timeout=600)
         if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
             return True, ""
@@ -1236,7 +1493,7 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
                  "-pix_fmt", "yuv420p"]
         if with_audio:
             cmd2 += ["-c:a", "aac", "-b:a", "192k"]
-        cmd2 += ["-movflags", "+faststart", out_path]
+        cmd2 += list(meta_args or []) + ["-movflags", "+faststart", out_path]
         r2 = subprocess.run(cmd2, capture_output=True, timeout=1200)
         if r2.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
             return True, ""
@@ -1269,6 +1526,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            audio_kbps: int = 192,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
+                           uniq_cfg: Optional[Dict[str, Any]] = None,
                            progress_cb=None) -> Tuple[bool, str]:
     """Full pipeline: render 5 segments in parallel, concat, cleanup.
 
@@ -1276,6 +1534,18 @@ def build_one_final_ffmpeg(video_paths: List[str],
     in the preview) instead of a random one.
     """
     canvas_w, canvas_h = resolution
+    # ---- уникализация: один свежий план на каждый собираемый ролик ----
+    uplan = make_uniq_plan(uniq_cfg)
+    if uplan:
+        if uplan.get("fps_delta"):
+            fps = max(20, min(60, int(fps) + int(uplan["fps_delta"])))
+        if uplan.get("dur"):
+            skip_hook = uplan.get("skip_hook", True)
+            target_durs = [
+                d if (i == 0 and skip_hook)
+                else max(0.35, float(d) * float(uplan["dur"][i % len(uplan["dur"])]))
+                for i, d in enumerate(target_durs)
+            ]
     temp = os.path.join(OUTPUT_DIR, f"_temp_{uuid.uuid4().hex[:8]}")
     os.makedirs(temp, exist_ok=True)
     seg_files: List[str] = []
@@ -1312,6 +1582,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                uniq=uniq_apply_to_segment(uplan, i),
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -1349,7 +1620,8 @@ def build_one_final_ffmpeg(video_paths: List[str],
             return False, "; ".join(errors[:3]) or "segment render failed"
         if progress_cb:
             progress_cb(80)
-        ok, err = concat_videos(seg_files, out_path, ffmpeg_exe, with_audio)
+        ok, err = concat_videos(seg_files, out_path, ffmpeg_exe, with_audio,
+                                meta_args=uniq_metadata_args(uplan))
         if not ok:
             return False, err
         if progress_cb:
@@ -3790,6 +4062,178 @@ class CharactersCard(SidebarCard):
     def _emit_config(self):
         self.configChanged.emit()
 
+
+# ======================================================================
+#  UNIQUE CARD (уникализатор)
+# ======================================================================
+
+class UniqCard(SidebarCard):
+    """Настройки уникализации: каждый ролик получает свой цифровой отпечаток."""
+    configChanged = pyqtSignal()
+
+    OPTIONS = [
+        ("flip",       "Зеркало по горизонтали",   "Сильнее всего ломает визуальный хеш (pHash). "
+                                                   "Осторожно с текстом в кадре и надписями."),
+        ("zoom",       "Микро-зум + сдвиг кадра",  "Кадр увеличивается на 1–6 % и сдвигается — "
+                                                   "меняется композиция и покадровые хеши."),
+        ("rotate",     "Микро-поворот",            "Поворот на 0.1–0.9°, незаметно глазу, "
+                                                   "но ломает пиксельное сравнение."),
+        ("color",      "Цвет: яркость/контраст/сатурация/гамма/hue",
+                                                   "Меняет цветовую гистограмму — один из "
+                                                   "ключевых признаков в fingerprint."),
+        ("grain",      "Зерно / шум",              "Ломает частотные паттерны (DCT), по которым "
+                                                   "платформа ищет дубликаты."),
+        ("sharpen",    "Микро-резкость / софт",    "Меняет высокие частоты изображения."),
+        ("vignette",   "Лёгкая виньетка",          "Затемнение по краям — меняет края кадра."),
+        ("audio",      "Звук: питч, громкость, EQ","Питч сдвигается с компенсацией темпа — "
+                                                   "длительность НЕ меняется, аудио-хеш другой."),
+        ("audio_noise","Неслышимый фоновый шум",   "Розовый шум на -50 dB: ломает аудио-фингерпринт."),
+        ("dur_jitter", "Дрожание длительностей",   "Каждый сегмент ±2–9 % по длине: ломает "
+                                                   "сравнение по структуре/ритму монтажа."),
+        ("fps_jitter", "FPS ±1",                   "Меняет частоту кадров ролика."),
+        ("metadata",   "Чистые метаданные + новый девайс",
+                                                   "Стирает EXIF/метаданные и подставляет "
+                                                   "случайный телефон, дату съёмки и UID."),
+        ("encoder",    "Дрожание кодировщика",     "CRF ±1, случайный GOP и число B-кадров — "
+                                                   "меняется битовый рисунок файла."),
+        ("rand_name",  "Случайное имя файла",      "Имя файла и его хеш всегда новые."),
+    ]
+
+    def __init__(self, main_window=None):
+        super().__init__("Уникальность", main_window)
+
+        s0 = self._add_section("Режим")
+        self.chk_enabled = QCheckBox("Включить уникализатор")
+        self.chk_enabled.setChecked(True)
+        self.chk_enabled.setToolTip("Каждый собранный ролик получает свой набор случайных "
+                                    "правок — Instagram не сопоставит его с предыдущими.")
+        s0._inner.addWidget(self.chk_enabled)
+
+        self.chk_skip_hook = QCheckBox("НЕ трогать хук (сегмент 1 / folder_1)")
+        self.chk_skip_hook.setChecked(True)
+        self.chk_skip_hook.setToolTip(
+            "Первые секунды решают всё: хук из folder_1 остаётся точно таким, "
+            "как ты его снял — без зеркала, зума, шума и изменения длительности. "
+            "Уникализируются только сегменты 2–5.")
+        s0._inner.addWidget(self.chk_skip_hook)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Сила"))
+        self.strength_combo = QComboBox()
+        self.strength_combo.addItems(["Лёгкая (незаметно)",
+                                      "Средняя (рекомендуется)",
+                                      "Сильная (макс. уникальность)"])
+        self.strength_combo.setCurrentIndex(1)
+        srow.addWidget(self.strength_combo, 1)
+        s0._inner.addLayout(srow)
+
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Зеркалить, % роликов"))
+        self.flip_spin = QSpinBox()
+        self.flip_spin.setRange(0, 100)
+        self.flip_spin.setValue(50)
+        self.flip_spin.setSuffix(" %")
+        prow.addWidget(self.flip_spin)
+        s0._inner.addLayout(prow)
+
+        s1 = self._add_section("Что менять")
+        self.checks: Dict[str, QCheckBox] = {}
+        for key, label, tip in self.OPTIONS:
+            c = QCheckBox(label)
+            c.setToolTip(tip)
+            c.setChecked(bool(DEFAULT_UNIQ.get(key, False)))
+            c.toggled.connect(self._changed)
+            s1._inner.addWidget(c)
+            self.checks[key] = c
+
+        s2 = self._add_section("Пресеты")
+        brow = QHBoxLayout()
+        b_safe = QPushButton("Безопасный")
+        b_safe.setObjectName("SmallBtn")
+        b_safe.setToolTip("Всё незаметно глазу: без зеркала и виньетки, средняя сила.")
+        b_safe.clicked.connect(lambda: self._preset("safe"))
+        b_max = QPushButton("Максимум")
+        b_max.setObjectName("SmallBtn")
+        b_max.setToolTip("Все слои включены, сильная степень — для массовых перезаливов.")
+        b_max.clicked.connect(lambda: self._preset("max"))
+        b_off = QPushButton("Выключить всё")
+        b_off.setObjectName("SmallBtn")
+        b_off.clicked.connect(lambda: self._preset("off"))
+        brow.addWidget(b_safe)
+        brow.addWidget(b_max)
+        brow.addWidget(b_off)
+        s2._inner.addLayout(brow)
+
+        self.hint = QLabel()
+        self.hint.setObjectName("Hint")
+        self.hint.setWordWrap(True)
+        s2._inner.addWidget(self.hint)
+
+        for w in (self.chk_enabled, self.chk_skip_hook):
+            w.toggled.connect(self._changed)
+        self.strength_combo.currentIndexChanged.connect(self._changed)
+        self.flip_spin.valueChanged.connect(self._changed)
+        self._changed()
+
+    # ------------------------------------------------------------ logic
+    def _preset(self, kind: str):
+        if kind == "off":
+            self.chk_enabled.setChecked(False)
+            return
+        self.chk_enabled.setChecked(True)
+        if kind == "safe":
+            on = {"zoom", "rotate", "color", "grain", "sharpen", "audio",
+                  "dur_jitter", "metadata", "encoder", "rand_name"}
+            self.strength_combo.setCurrentIndex(1)
+        else:
+            on = {k for k, _, _ in self.OPTIONS}
+            self.strength_combo.setCurrentIndex(2)
+        for k, c in self.checks.items():
+            c.setChecked(k in on)
+
+    def _changed(self, _=None):
+        n = sum(1 for c in self.checks.values() if c.isChecked())
+        if not self.chk_enabled.isChecked():
+            self.hint.setText("Уникализатор выключен — все ролики будут "
+                              "технически одинаковыми.")
+        else:
+            hook = ("хук не трогаем" if self.chk_skip_hook.isChecked()
+                    else "хук тоже уникализируется")
+            self.hint.setText(f"Активно слоёв: {n} · {hook} · "
+                              f"новый отпечаток на каждый ролик.")
+        self.configChanged.emit()
+
+    # ----------------------------------------------------------- config
+    def get_uniq_config(self) -> Dict[str, Any]:
+        cfg = {
+            "enabled": self.chk_enabled.isChecked(),
+            "skip_hook": self.chk_skip_hook.isChecked(),
+            "strength": self.strength_combo.currentIndex(),
+            "flip_prob": self.flip_spin.value(),
+        }
+        for k, c in self.checks.items():
+            cfg[k] = c.isChecked()
+        return cfg
+
+    def set_uniq_config(self, cfg: Dict[str, Any]):
+        if not isinstance(cfg, dict):
+            cfg = {}
+        widgets = [self.chk_enabled, self.chk_skip_hook, self.strength_combo,
+                   self.flip_spin] + list(self.checks.values())
+        for w in widgets:
+            w.blockSignals(True)
+        self.chk_enabled.setChecked(bool(cfg.get("enabled", DEFAULT_UNIQ["enabled"])))
+        self.chk_skip_hook.setChecked(bool(cfg.get("skip_hook", True)))
+        self.strength_combo.setCurrentIndex(
+            max(0, min(2, _to_int(cfg.get("strength"), 1))))
+        self.flip_spin.setValue(max(0, min(100, _to_int(cfg.get("flip_prob"), 50))))
+        for k, c in self.checks.items():
+            c.setChecked(bool(cfg.get(k, DEFAULT_UNIQ.get(k, False))))
+        for w in widgets:
+            w.blockSignals(False)
+        self._changed()
+
+
 # ======================================================================
 #  BATCH CARD
 # ======================================================================
@@ -4124,11 +4568,15 @@ class BuildWorker(QThread):
             rand_flags = [c.chk_random.isChecked() for c in self.main.cards]
             rand_idx = [c.current_idx for c in self.main.cards]
             exp = self.main.export_card.get_export_config()
+            uniq_cfg = self.main.uniq_card.get_uniq_config()
             canvas = self._canvas_size(exp)
             self.progress.emit(5, "Подготовка сегментов…")
 
             # unique output name
             out_name = f"final_video_{self.main.video_counter:04d}.mp4"
+            if uniq_cfg.get("enabled") and uniq_cfg.get("rand_name"):
+                out_name = (f"final_video_{self.main.video_counter:04d}_"
+                            f"{uuid.uuid4().hex[:8]}.mp4")
             self.main.video_counter += 1
             out_path = os.path.join(OUTPUT_DIR, out_name)
 
@@ -4144,6 +4592,7 @@ class BuildWorker(QThread):
                 blur_fill=exp.get("blur_fill", False),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                 random_flags=rand_flags, preset_indices=rand_idx,
+                uniq_cfg=uniq_cfg,
                 progress_cb=cb)
             if not ok:
                 # MoviePy fallback
@@ -4198,6 +4647,7 @@ class BatchBuildWorker(QThread):
                 self.failed.emit("ffmpeg не найден.")
                 return
             exp = self.main.export_card.get_export_config()
+            uniq_cfg = self.main.uniq_card.get_uniq_config()
             bcfg = self.main.batch_card.get_batch_config()
             canvas = self.main.build_worker_canvas(exp)
             presets = [c.presets for c in self.main.cards]
@@ -4292,6 +4742,9 @@ class BatchBuildWorker(QThread):
                 if not vp:
                     return None
                 out_name = f"{char_name}_{vid_idx + 1:04d}.mp4"
+                if uniq_cfg.get("enabled") and uniq_cfg.get("rand_name"):
+                    out_name = (f"{char_name}_{vid_idx + 1:04d}_"
+                                f"{uuid.uuid4().hex[:8]}.mp4")
                 out_path = os.path.join(OUTPUT_DIR, out_name)
                 if os.path.exists(out_path):
                     base, ext = os.path.splitext(out_name)
@@ -4307,7 +4760,8 @@ class BatchBuildWorker(QThread):
                     ten_bit=exp.get("ten_bit", False),
                     blur_fill=exp.get("blur_fill", False),
                     audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
-                    random_flags=rand_flags, preset_indices=rand_idx)
+                    random_flags=rand_flags, preset_indices=rand_idx,
+                    uniq_cfg=uniq_cfg)
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
                     return None
@@ -4481,6 +4935,7 @@ class MainWindow(QMainWindow):
         sbl.setSpacing(0)
 
         self.export_card = ExportCard(self)
+        self.uniq_card = UniqCard(self)
         self.characters_card = CharactersCard(self)
         self.batch_card = BatchCard(self)
         self.ffmpeg_card = FfmpegCard(self)
@@ -4491,6 +4946,7 @@ class MainWindow(QMainWindow):
         self._sidebar_pages = []
         for label, card in [
             ("Экспорт", self.export_card),
+            ("Уник", self.uniq_card),
             ("Персонажи", self.characters_card),
             ("Батч", self.batch_card),
             ("FFMPEG", self.ffmpeg_card),
@@ -4546,6 +5002,7 @@ class MainWindow(QMainWindow):
 
         # signal wiring
         self.export_card.configChanged.connect(self._on_config_changed)
+        self.uniq_card.configChanged.connect(self._on_config_changed)
         self.characters_card.configChanged.connect(self._on_batch_config_changed)
         self.batch_card.configChanged.connect(self._on_batch_config_changed)
         self.ffmpeg_card.configChanged.connect(self._on_config_changed)
@@ -4607,6 +5064,7 @@ class MainWindow(QMainWindow):
         self.project = {
             "segments": [c.get_config() for c in self.cards],
             "export": self.export_card.get_export_config(),
+            "uniq": self.uniq_card.get_uniq_config(),
             "batch": self.batch_card.get_batch_config(),
             "ui": {
                 "tab": self.stack.currentIndex(),
@@ -4633,6 +5091,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 traceback.print_exc()
             try:
+                self.uniq_card.set_uniq_config(self.project.get("uniq", {}))
+            except Exception:
+                traceback.print_exc()
+            try:
                 self.batch_card.set_batch_config(self.project.get("batch", {}))
             except Exception:
                 traceback.print_exc()
@@ -4653,7 +5115,8 @@ class MainWindow(QMainWindow):
             ui = self.project.get("ui", {}) if isinstance(
                 self.project.get("ui", {}), dict) else {}
             side_tab = _to_int(ui.get("sidebar_tab"), 0)
-            self.sidebar_tabs.setCurrentIndex(min(3, max(0, side_tab)))
+            self.sidebar_tabs.setCurrentIndex(
+                min(self.sidebar_tabs.count() - 1, max(0, side_tab)))
         except Exception:
             pass
 
