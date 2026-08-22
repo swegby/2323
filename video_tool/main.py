@@ -1081,21 +1081,27 @@ def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
     )
 
 
-def _originality_prefix(enabled: bool, intensity: float = 0.55) -> str:
-    """Subtle editorial treatment; never flips or mirrors the source.
+def _originality_prefix(enabled: bool, intensity: float = 0.75) -> str:
+    """Apply a visible editorial treatment without flipping the source.
 
-    This is intentionally restrained: it improves an original edit with a
-    small color/noise fingerprint rather than trying to disguise reposts.
+    The effect is deliberately an edit (reframe + grade + texture), not a
+    repost-evasion trick.  There is no hflip/vflip here by design.
     """
     if not enabled:
         return ""
     level = max(0.0, min(1.0, float(intensity)))
-    contrast = 1.0 + 0.045 * level
-    saturation = 1.0 + 0.10 * level
-    brightness = 0.008 * level
-    noise = max(1, int(round(2 + 4 * level)))
-    return (f"eq=contrast={contrast:.4f}:brightness={brightness:.4f}:"
-            f"saturation={saturation:.4f},noise=alls={noise}:allf=t+u,")
+    # A small, visible reframe plus grade.  The zoom is performed before the
+    # normal aspect-ratio fit, so it works for both portrait and landscape.
+    zoom = 1.0 + 0.045 * level
+    contrast = 1.0 + 0.12 * level
+    saturation = 1.0 + 0.25 * level
+    brightness = 0.018 * level
+    noise = max(2, int(round(6 + 12 * level)))
+    return (f"scale=ceil(iw*{zoom:.4f}/2)*2:ceil(ih*{zoom:.4f}/2)*2,"
+            f"crop=iw/{zoom:.4f}:ih/{zoom:.4f},"
+            f"eq=contrast={contrast:.4f}:brightness={brightness:.4f}:"
+            f"saturation={saturation:.4f},unsharp=5:5:0.18:5:5:0,"
+            f"noise=alls={noise}:allf=t+u,")
 
 
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
@@ -1106,7 +1112,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
                          audio_kbps: int = 192,
-                         originality: bool = True, originality_intensity: float = 0.55,
+                         originality: bool = True, originality_intensity: float = 0.75,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
@@ -1286,7 +1292,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            ten_bit: bool = False,
                            blur_fill: bool = False,
                            audio_kbps: int = 192,
-                           originality: bool = True, originality_intensity: float = 0.55,
+                           originality: bool = True, originality_intensity: float = 0.75,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
                            progress_cb=None) -> Tuple[bool, str]:
@@ -3359,8 +3365,8 @@ class ExportCard(SidebarCard):
         orig_row.addWidget(QLabel("Интенсивность"))
         self.originality_slider = QSlider(Qt.Orientation.Horizontal)
         self.originality_slider.setRange(0, 100)
-        self.originality_slider.setValue(55)
-        self.originality_slider.setToolTip("0 — выключено, 100 — заметнее; обычно достаточно 35–60")
+        self.originality_slider.setValue(75)
+        self.originality_slider.setToolTip("0 — выключено, 100 — заметнее; обычно достаточно 60–85")
         orig_row.addWidget(self.originality_slider, 1)
         s2._inner.addWidget(self.chk_originality)
         s2._inner.addLayout(orig_row)
@@ -4181,7 +4187,7 @@ class BuildWorker(QThread):
                 ten_bit=exp.get("ten_bit", False),
                 blur_fill=exp.get("blur_fill", False),
                 originality=exp.get("originality", True),
-                originality_intensity=exp.get("originality_intensity", 0.55),
+                originality_intensity=exp.get("originality_intensity", 0.75),
                 audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                 random_flags=rand_flags, preset_indices=rand_idx,
                 progress_cb=cb)
@@ -4347,7 +4353,7 @@ class BatchBuildWorker(QThread):
                     ten_bit=exp.get("ten_bit", False),
                     blur_fill=exp.get("blur_fill", False),
                     originality=exp.get("originality", True),
-                    originality_intensity=exp.get("originality_intensity", 0.55),
+                    originality_intensity=exp.get("originality_intensity", 0.75),
                     audio_kbps=256 if exp["quality_text"].startswith("💎") else 192,
                     random_flags=rand_flags, preset_indices=rand_idx)
                 if not ok:
