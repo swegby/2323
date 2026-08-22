@@ -170,6 +170,7 @@ DEFAULT_UNIQ: Dict[str, Any] = {
     "color": True,            # яркость / контраст / насыщенность / гамма / hue
     "grain": True,            # плёночное зерно (ломает частотные паттерны)
     "vignette": False,        # лёгкая виньетка
+    "grid": False,            # динамическая сетка-оверлей с низкой прозрачностью
     "sharpen": True,          # микро-резкость/размытие
     "audio": True,            # питч ±, громкость, EQ (длительность сохраняется)
     "audio_noise": False,     # неслышимый розовый шум в фоне
@@ -192,6 +193,7 @@ UNIQ_RANGES = {
     "hue":       [(0.4, 1.5),     (1.0, 3.0),     (2.5, 6.0)],
     "grain":     [(1.5, 4.0),     (3.0, 8.0),     (7.0, 14.0)],
     "sharpen":   [(0.05, 0.20),   (0.15, 0.45),   (0.35, 0.80)],
+    "grid_alpha":[(0.015, 0.035), (0.03, 0.065),  (0.06, 0.10)],
     "pitch":     [(0.002, 0.006), (0.005, 0.013), (0.012, 0.025)],
     "volume":    [(0.2, 0.6),     (0.5, 1.2),     (1.0, 2.0)],
     "dur":       [(0.010, 0.025), (0.02, 0.05),   (0.04, 0.09)],
@@ -1192,6 +1194,23 @@ def make_uniq_plan(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         p["vignette"] = random.uniform(0.06, 0.18)
     if cfg.get("sharpen"):
         p["sharpen"] = _sym(cfg, "sharpen")
+    if cfg.get("grid"):
+        lo, hi = _rng_range(cfg, "grid_alpha")
+        p["grid"] = {
+            "alpha": random.uniform(lo, hi),
+            "cell": random.choice([40, 56, 72, 90, 110, 140, 180]),
+            "line": random.choice([1, 1, 2]),
+            "vx": random.uniform(-18.0, 18.0),
+            "vy": random.uniform(-18.0, 18.0),
+            "phase_x": random.uniform(0, 200),
+            "phase_y": random.uniform(0, 200),
+            "diag": random.random() < 0.35,
+            "dots": random.random() < 0.25,
+            "color": random.choice([(255, 255, 255), (238, 245, 255),
+                                    (255, 248, 232), (228, 255, 246),
+                                    (255, 236, 246)]),
+            "png": "",
+        }
     if cfg.get("audio"):
         p["pitch"] = 1.0 + _sym(cfg, "pitch")
         p["volume"] = _sym(cfg, "volume")
@@ -1220,6 +1239,49 @@ def make_uniq_plan(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "uid": uuid.uuid4().hex.upper(),
         }
     return p
+
+
+def make_grid_png(g: Dict[str, Any], W: int, H: int, path: str) -> bool:
+    """Плитка-сетка на прозрачном фоне (на клетку больше кадра — для бесшовного дрейфа)."""
+    try:
+        cell = max(16, int(g.get("cell", 80)))
+        line = max(1, int(g.get("line", 1)))
+        alpha = max(1, min(255, int(round(float(g.get("alpha", 0.05)) * 255))))
+        r, gg, b = g.get("color", (255, 255, 255))
+        img = Image.new("RGBA", (W + cell, H + cell), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        col = (int(r), int(gg), int(b), alpha)
+        iw, ih = img.size
+        if g.get("dots"):
+            rad = max(1, line)
+            for y in range(0, ih + cell, cell):
+                for x in range(0, iw + cell, cell):
+                    d.ellipse([x - rad, y - rad, x + rad, y + rad], fill=col)
+        elif g.get("diag"):
+            step = cell
+            for k in range(-ih, iw + ih, step):
+                d.line([(k, 0), (k + ih, ih)], fill=col, width=line)
+                d.line([(k, ih), (k + ih, 0)], fill=col, width=line)
+        else:
+            for x in range(0, iw + cell, cell):
+                d.line([(x, 0), (x, ih)], fill=col, width=line)
+            for y in range(0, ih + cell, cell):
+                d.line([(0, y), (iw, y)], fill=col, width=line)
+        img.save(path, "PNG")
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _grid_drift_expr(v: float, cell: int, phase: float) -> str:
+    """Выражение overlay для непрерывного движения сетки (в пределах одной клетки)."""
+    a = abs(float(v))
+    if a < 0.5:
+        a = 0.5
+    if v >= 0:
+        return f"-mod(t*{a:.3f}+{phase:.2f}\\,{cell})"
+    return f"-{cell}+mod(t*{a:.3f}+{phase:.2f}\\,{cell})"
 
 
 def uniq_video_chain(plan: Optional[Dict[str, Any]], W: int, H: int) -> str:
@@ -1413,11 +1475,26 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         png_idx = 2 if need_silent else 1
         cmd += ["-loop", "1", "-i", text_png]
         vf.append(f"[{png_idx}:v]format=rgba[fg]")
+
+        # ---- динамическая сетка-оверлей (под текстом, поверх видео) ----
+        bg_label = "bg"
+        grid = (uniq or {}).get("grid") or {}
+        grid_png = grid.get("png") or ""
+        if grid_png and os.path.isfile(grid_png):
+            grid_idx = png_idx + 1
+            cmd += ["-loop", "1", "-i", grid_png]
+            cell = max(16, int(grid.get("cell", 80)))
+            gx = _grid_drift_expr(grid.get("vx", 6.0), cell, grid.get("phase_x", 0.0))
+            gy = _grid_drift_expr(grid.get("vy", 6.0), cell, grid.get("phase_y", 0.0))
+            vf.append(f"[{grid_idx}:v]format=rgba[grd]")
+            vf.append(f"[bg][grd]overlay={gx}:{gy}:shortest=1[bgg]")
+            bg_label = "bgg"
+
         cs_opt = get_format_color_opt(ffmpeg_exe)
         fmt = f"format={pix}" + (":" + cs_opt if cs_opt else "")
         # text PNG is FULL canvas with the text already drawn at its absolute
         # position -> overlay at 0:0 (any other offset would shift it off-screen)
-        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{fmt}[v]")
+        vf.append(f"[{bg_label}][fg]overlay=0:0:shortest=1,{fmt}[v]")
 
         cmd += ["-filter_complex", ";".join(vf)]
         cmd += ["-map", "[v]"]
@@ -1548,6 +1625,12 @@ def build_one_final_ffmpeg(video_paths: List[str],
             ]
     temp = os.path.join(OUTPUT_DIR, f"_temp_{uuid.uuid4().hex[:8]}")
     os.makedirs(temp, exist_ok=True)
+    if uplan and uplan.get("grid"):
+        gpng = os.path.join(temp, f"grid_{uuid.uuid4().hex[:6]}.png")
+        if make_grid_png(uplan["grid"], canvas_w, canvas_h, gpng):
+            uplan["grid"]["png"] = gpng
+        else:
+            uplan.pop("grid", None)
     seg_files: List[str] = []
     errors: List[str] = []
 
@@ -4085,6 +4168,12 @@ class UniqCard(SidebarCard):
                                                    "платформа ищет дубликаты."),
         ("sharpen",    "Микро-резкость / софт",    "Меняет высокие частоты изображения."),
         ("vignette",   "Лёгкая виньетка",          "Затемнение по краям — меняет края кадра."),
+        ("grid",       "Динамическая сетка (оверлей)",
+                                                   "Полупрозрачная сетка/точки поверх видео, "
+                                                   "которая плавно ползёт по кадру. Прозрачность "
+                                                   "1.5–10 % — глазу почти не видна, но каждый "
+                                                   "кадр становится другим: ломает покадровые "
+                                                   "хеши и статичные сцены."),
         ("audio",      "Звук: питч, громкость, EQ","Питч сдвигается с компенсацией темпа — "
                                                    "длительность НЕ меняется, аудио-хеш другой."),
         ("audio_noise","Неслышимый фоновый шум",   "Розовый шум на -50 dB: ломает аудио-фингерпринт."),
@@ -4182,7 +4271,7 @@ class UniqCard(SidebarCard):
             return
         self.chk_enabled.setChecked(True)
         if kind == "safe":
-            on = {"zoom", "rotate", "color", "grain", "sharpen", "audio",
+            on = {"zoom", "rotate", "color", "grain", "sharpen", "grid", "audio",
                   "dur_jitter", "metadata", "encoder", "rand_name"}
             self.strength_combo.setCurrentIndex(1)
         else:
