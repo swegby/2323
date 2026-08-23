@@ -62,6 +62,26 @@ except Exception:
     except Exception:
         VideoFileClip = None
 
+
+def _moviepy_quiet() -> None:
+    """Убирает отладочный спам moviepy 2.1.2 в консоль.
+
+    В FFMpeg_VideoReader.initialize() стоят безусловные print(self.infos)
+    (огромный словарь метаданных) и print(" ".join(cmd)) (полная команда
+    ffmpeg) — по два вывода на каждое открытие видео. Подменяем print
+    внутри модуля ffmpeg_reader: это потокобезопасно (не трогаем
+    sys.stdout) и не глушит чужой вывод.
+    """
+    try:
+        from moviepy.video.io import ffmpeg_reader as _ffr
+        _ffr.print = lambda *args, **kwargs: None
+    except Exception:
+        pass
+
+
+if VideoFileClip is not None:
+    _moviepy_quiet()
+
 import imageio_ffmpeg
 import requests
 
@@ -580,7 +600,8 @@ def get_ffmpeg_exe() -> str:
 def get_ffmpeg_version(path: str) -> str:
     try:
         r = subprocess.run([path, "-version"], capture_output=True,
-                           text=True, timeout=15)
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=15)
         if r.returncode == 0:
             return r.stdout.splitlines()[0].strip()
     except Exception:
@@ -595,9 +616,10 @@ def _probe(path: str, ffmpeg_exe: str) -> Dict[str, Any]:
     try:
         r = subprocess.run(
             [ffmpeg_exe, "-hide_banner", "-i", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
-        txt = r.stderr
+        txt = r.stderr or ""
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", txt)
         if m:
             h, mi, s = m.groups()
@@ -1075,7 +1097,8 @@ def get_format_color_opt(ffmpeg_exe: str) -> str:
     opt = "color_spaces=bt709"
     try:
         r = subprocess.run([ffmpeg_exe, "-hide_banner", "-h", "filter=format"],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=20)
         txt = (r.stdout or "") + (r.stderr or "")
         if "color_spaces" in txt:
             opt = "color_spaces=bt709"
@@ -5040,4 +5063,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Windows-консоль в cp1251/cp1252 (в т.ч. при выводе в файл):
+    # не падаем на печати эмодзи/русского текста.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and hasattr(_stream, "reconfigure"):
+                _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     main()

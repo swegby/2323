@@ -42,6 +42,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 # ----------------------------------------------------------------------
+# Консоль Windows может работать в cp1251/cp1252 (особенно при переносе
+# вывода в файл: python bot.py > log.txt). Тогда печать эмодзи/русского
+# текста падает с UnicodeEncodeError. Разрешаем заменять проблемные
+# символы вместо краха.
+# ----------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------------
 # main.py импортирует PyQt6 на уровне модуля. Боту GUI не нужен, поэтому
 # если PyQt6 не установлен / не загружается (headless-сервер без libGL) —
 # подставляем заглушки, чтобы импорт рендер-движка не падал.
@@ -453,11 +466,19 @@ def process_hook_only(src: str, out_path: str, ffmpeg_exe: str,
         # ---- без уника: remux без перекода видео (качество 1:1).
         # аудио copy только если это AAC — иначе (PCM/ALAC из MOV)
         # конвертим в AAC, чтобы mp4 играли все плееры/платформы.
+        # ffmpeg всегда пишет вывод в UTF-8 (в баннере — путь файла с
+        # русскими буквами). text=True без явного encoding на Windows
+        # декодирует вывод системной кодировкой (cp1251/cp1252), и
+        # reader-поток subprocess падает с
+        # UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f ...
+        # («я» в UTF-8 — это D1 8F). Форсируем UTF-8 с заменой ошибок.
         aac_src = False
         try:
             pr = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", src],
-                                capture_output=True, text=True, timeout=30)
-            aac_src = bool(re.search(r"Audio:\s*aac\b", pr.stderr))
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=30)
+            aac_src = bool(re.search(r"Audio:\s*aac\b", pr.stderr or ""))
         except Exception:
             pass
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
