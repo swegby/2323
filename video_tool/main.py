@@ -89,8 +89,20 @@ VIDEO_EXTS = {
 
 # Bright color map used by [blue]...[ /blue] tags and quick buttons
 COLOR_MAP: Dict[str, str] = {
-    "blue":   "#00D5FF",
-    "cyan":   "#00E5FF",
+    # ---- синие (насыщенные, много оттенков) ----
+    "blue":       "#0066FF",   # основной — сочный электрик, не бледный
+    "electric":   "#0047FF",   # электрик глубже
+    "royal":      "#2952FF",   # королевский
+    "neonblue":   "#1F51FF",   # неоновый
+    "deepblue":   "#0026FF",   # ультра-глубокий
+    "ultramarine": "#3B24FF",  # ультрамарин
+    "indigo":     "#4B0DFF",   # индиго
+    "navy":       "#0A2FA8",   # тёмно-синий
+    "azure":      "#007FFF",   # лазурный
+    "sky":        "#2EB8FF",   # небесный
+    "babyblue":   "#7FDBFF",   # светло-голубой
+    "cyan":       "#00E5FF",   # бирюзово-голубой (старый "blue" был похож на него)
+    # ---- остальные ----
     "red":    "#FF4D6D",
     "yellow": "#FFD54F",
     "green":  "#4DFF8C",
@@ -598,6 +610,35 @@ def _probe(path: str, ffmpeg_exe: str) -> Dict[str, Any]:
         pm = re.search(r"Video:.*?(yuv\d+p\d+le|p010le|p210le|p016le|yuv444p12le)", txt)
         info["pix_fmt"] = pm.group(1) if pm else ""
         info["ten_bit"] = bool(pm)
+        # ---- color info: range + primaries/transfer/matrix ----
+        # examples:  yuv420p(tv, bt709, progressive)
+        #            yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)
+        #            yuvj420p(pc, progressive)
+        info["color_range"] = ""
+        info["color_trc"] = ""
+        info["color_primaries"] = ""
+        # match the parens right after the pixel format token:
+        #   ", yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)"
+        cm = re.search(r"Video:[^\n]*?,\s*[a-z0-9]+le?\(([^)]*)\)", txt)
+        if not cm:
+            cm = re.search(r"Video:[^\n]*?,\s*yuvj?\d+p[\da-z]*\(([^)]*)\)", txt)
+        if cm:
+            inner = cm.group(1)
+            parts = [p.strip() for p in inner.split(",")]
+            for p in parts:
+                if p in ("tv", "pc"):
+                    info["color_range"] = p
+                elif "/" in p:                       # matrix/primaries/transfer
+                    bits = p.split("/")
+                    if len(bits) >= 3:
+                        info["color_primaries"] = bits[1].strip()
+                        info["color_trc"] = bits[2].strip()
+                elif p.startswith("bt") or "smpte" in p or "arib" in p:
+                    info["color_primaries"] = p
+        info["hdr"] = (
+            info["color_trc"] in ("smpte2084", "arib-std-b67")
+            or "bt2020" in info["color_primaries"]
+        )
     except Exception:
         pass
     return info
@@ -1059,25 +1100,55 @@ def build_atempo(factor: float) -> str:
 
 
 def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
-                   blur_fill: bool = False) -> str:
+                   blur_fill: bool = False, prefix: str = "") -> str:
     """Background filter chain ending with the [bg] output label.
 
     Normal: scale+center-crop. blur_fill: full-frame blurred copy behind the
     centered original (no content lost for non-vertical sources).
+    prefix: optional color-normalization filters inserted before scaling
+    (HDR tonemap / full-range fix for MOV sources).
     """
     if not blur_fill:
         return (
+            f"{prefix}"
             f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-            f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
+            f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
         )
     return (
+        f"{prefix}"
         f"split[bgA][fgA];"
         f"[bgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-        f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,"
+        f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,"
         f"boxblur=20:5,eq=brightness=-0.12,fps={fps}[blur];"
         f"[fgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:"
-        f"flags=lanczos[fgvid];"
+        f"flags=bicubic[fgvid];"
         f"[blur][fgvid]overlay=(W-w)/2:(H-h)/2[bg]"
+    )
+
+
+def _micro_uniq_chain(canvas_w: int, canvas_h: int) -> str:
+    """Invisible-to-the-eye uniquification filters (fresh random each call).
+
+    Changes the pixel data (hence hash/fingerprint) without visible impact:
+      • sub-pixel shift: upscale + crop with a random 1-6 px offset
+      • micro eq: brightness ±0.004, contrast/saturation ±0.008
+      • micro hue rotation ±0.4°
+      • faint film grain (strength 1) with a random seed
+    """
+    pad = 6                                  # work area for the shift crop
+    dx = random.randint(0, 4)
+    dy = random.randint(0, 4)
+    br = random.uniform(-0.004, 0.004)
+    ct = random.uniform(0.992, 1.008)
+    sat = random.uniform(0.992, 1.008)
+    hue = random.uniform(-0.4, 0.4)
+    seed = random.randint(0, 2 ** 31 - 1)
+    return (
+        f"scale={canvas_w + pad}:{canvas_h + pad}:flags=bicubic,"
+        f"crop={canvas_w}:{canvas_h}:{dx}:{dy},"
+        f"eq=brightness={br:.5f}:contrast={ct:.5f}:saturation={sat:.5f},"
+        f"hue=h={hue:.3f},"
+        f"noise=alls=1:allf=t:all_seed={seed},"
     )
 
 
@@ -1088,28 +1159,54 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          with_audio: bool = True,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
-                         audio_kbps: int = 192,
+                         audio_kbps: int = 192, micro_uniq: bool = False,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
     ten_bit  — keep 10-bit depth when the source is 10-bit (no banding).
     blur_fill— blurred background fill instead of hard crop for wrong aspect.
+    micro_uniq — invisible pixel-level uniquification (random sub-pixel
+    shift + micro color/grain) so every output has a different fingerprint.
     """
     try:
         target_dur = max(0.3, float(target_dur))
         orig_dur = max(0.05, float(orig_dur or target_dur))
         has_audio = with_audio and video_has_audio(input_video, ffmpeg_exe)
 
+        # probe source color info (HDR / full-range MOVs from iPhone etc.)
+        src_info: Dict[str, Any] = {}
+        try:
+            src_info = _probe(input_video, ffmpeg_exe)
+        except Exception:
+            src_info = {}
+
         # decide output pixel format (10-bit only when source is 10-bit)
         use10 = False
         if ten_bit:
-            try:
-                use10 = bool(_probe(input_video, ffmpeg_exe).get("ten_bit"))
-            except Exception:
-                use10 = False
+            use10 = bool(src_info.get("ten_bit"))
         pix = "yuv420p10le" if use10 else "yuv420p"
 
-        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        # ---- color normalization prefix for MOV/iPhone sources ----
+        # HDR (HLG/PQ/bt2020): proper tonemap to SDR bt709 — otherwise the
+        # colors get oversaturated / oversharpened-looking after a naive
+        # matrix reinterpretation.
+        # Full-range (pc/yuvj420p): explicit pc->tv conversion — otherwise
+        # contrast gets crushed/boosted ("повышенная резкость" look).
+        color_fix = ""
+        if src_info.get("hdr"):
+            color_fix = (
+                "zscale=t=linear:npl=100,format=gbrpf32le,"
+                "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+            )
+        elif src_info.get("color_range") == "pc":
+            color_fix = (
+                "scale=in_range=pc:out_range=tv,"
+                "setparams=range=tv:colorspace=bt709,"
+            )
+
+        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill,
+                                  prefix=color_fix)
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
@@ -1121,13 +1218,18 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         # otherwise the container gets padded to the longer audio
         silent_dur = target_dur if is_first else min(orig_dur, target_dur)
 
+        # normalize audio for safe concat -c copy: constant 44.1k, async
+        # resample kills MOV/iPhone priming-sample drift, apad guarantees
+        # the track is at least as long as the video (then -t cuts exact)
+        A_NORM = "aresample=44100:async=1:first_pts=0,apad"
+
         if is_first and orig_dur > target_dur:
             # ---------- SPEED UP (first segment too long) ----------
             speed_factor = orig_dur / target_dur
             cmd += ["-i", input_video]
             vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{bg_chain}")
             if has_audio:
-                vf.append(f"[0:a]{build_atempo(speed_factor)}[a]")
+                vf.append(f"[0:a]{build_atempo(speed_factor)},{A_NORM}[a]")
                 audio_idx = 0
         elif is_first and orig_dur < target_dur:
             # ---------- LOOP (first segment too short) ----------
@@ -1135,7 +1237,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-stream_loop", str(loop), "-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
             trim_out = target_dur
         else:
@@ -1147,7 +1249,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
 
         # silent track when audio requested but source has none
@@ -1165,7 +1267,8 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         fmt = f"format={pix}" + (":" + cs_opt if cs_opt else "")
         # text PNG is FULL canvas with the text already drawn at its absolute
         # position -> overlay at 0:0 (any other offset would shift it off-screen)
-        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{fmt}[v]")
+        uniq = _micro_uniq_chain(canvas_w, canvas_h) if micro_uniq else ""
+        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{uniq}{fmt}[v]")
 
         cmd += ["-filter_complex", ";".join(vf)]
         cmd += ["-map", "[v]"]
@@ -1180,8 +1283,13 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         if audio_idx >= 0:
             cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k",
                     "-ar", "44100", "-ac", "2"]
-        if trim_out:
-            cmd += ["-t", f"{trim_out:.3f}"]
+        # -t is mandatory: apad makes the audio endless, and MOV sources
+        # often report audio slightly longer than video — cut both exactly
+        out_t = trim_out if trim_out else (target_dur if is_first
+                                           else min(orig_dur, target_dur))
+        cmd += ["-t", f"{out_t:.3f}"]
+        # identical timebase in every segment -> concat -c copy never breaks
+        cmd += ["-video_track_timescale", "90000"]
         cmd += ["-movflags", "+faststart", seg_out]
 
         if progress_cb:
@@ -1209,9 +1317,22 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
         with open(tmp_list, "w", encoding="utf-8") as f:
             for s in seg_files:
                 f.write("file '" + s.replace("\\", "/").replace("'", "'\\''") + "'\n")
+        # video: lossless stream copy. audio: cheap re-encode — AAC frames
+        # are 1024 samples, so each segment's audio is a hair longer than
+        # its video; pure -c copy then yields non-monotonic DTS (broken
+        # timestamps, players stutter — especially with MOV sources).
+        # aresample=async=1 re-times audio into one continuous track.
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-fflags", "+genpts",
                "-f", "concat", "-safe", "0", "-i", tmp_list,
-               "-c", "copy", out_path]
+               "-c:v", "copy"]
+        if with_audio:
+            cmd += ["-af", "aresample=44100:async=1:first_pts=0",
+                    "-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2",
+                    "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-movflags", "+faststart", out_path]
         r = subprocess.run(cmd, capture_output=True, timeout=600)
         if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
             return True, ""
@@ -1269,11 +1390,15 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            audio_kbps: int = 192,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
+                           micro_uniq: bool = False,
                            progress_cb=None) -> Tuple[bool, str]:
     """Full pipeline: render 5 segments in parallel, concat, cleanup.
 
     random_flags[i]=False -> use segment i's CURRENT preset (the one shown
     in the preview) instead of a random one.
+    micro_uniq=True -> segments 2-5 (folder_2..folder_5 material) get an
+    invisible random pixel-level uniquification, so every build has a
+    different hash/fingerprint even from the same source files.
     """
     canvas_w, canvas_h = resolution
     temp = os.path.join(OUTPUT_DIR, f"_temp_{uuid.uuid4().hex[:8]}")
@@ -1312,6 +1437,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                micro_uniq=(micro_uniq and i >= 1),
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -2811,6 +2937,23 @@ class SegmentCard(QFrame):
             crow.addWidget(b)
         crow.addStretch(1)
         edl.addLayout(crow)
+
+        # ---- вторая строка: оттенки синего ----
+        blues = ["electric", "royal", "neonblue", "deepblue",
+                 "ultramarine", "indigo", "navy", "azure", "sky", "babyblue"]
+        brow = QHBoxLayout()
+        brow.setSpacing(5)
+        brow.addWidget(QLabel("Синие:"))
+        for name in blues:
+            b = QPushButton()
+            b.setObjectName("ColorBtn")
+            b.setStyleSheet(f"QPushButton#ColorBtn {{ background: {COLOR_MAP[name]}; }}")
+            b.setToolTip(f"[{name}]…[/{name}]  {COLOR_MAP[name]}")
+            b.clicked.connect(lambda _, n=name: self._insert_color(n))
+            self._color_btns.append(b)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        edl.addLayout(brow)
         root.addWidget(ed_frame)
 
         # ================= POSITION / SIZE =================
