@@ -1,0 +1,8 @@
+__pycache__/
+output/
+*.pyc
+venv/
+
+# музыка пользователя — не тащим в git
+video_tool/music/*
+!video_tool/music/README.txt
