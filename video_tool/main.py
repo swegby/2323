@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.7"
+APP_VERSION = "v2.8"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1156,25 +1156,50 @@ def _micro_uniq_chain(canvas_w: int, canvas_h: int) -> str:
 #  FINAL UNIQ — нормальная уникализация собранного ролика
 # ======================================================================
 # Один пост-проход по уже собранному файлу (работает и в одиночной сборке,
-# и в батче, и во всех режимах бота):
+# и в батче, и во всех режимах бота). 3 уровня силы: light / medium / strong
 #   • цветокор: лёгкое затемнение + случайный оттенок (тёплый/холодный/
 #     пурпурный/зелёный/teal-orange), микро-гамма/контраст/насыщенность/hue
-#   • небольшой кроп по краям (1.2–2.2%) с масштабом обратно в полный кадр
-#   • микроповорот ±0.25–0.6° с увеличением — чёрных полос от поворота нет:
-#     вместо них из-под углов еле заметно выглядывает размытый фон
+#   • небольшой кроп по краям (1.2–3.2%) с масштабом обратно в полный кадр
+#   • микроповорот (до ±1.1° на сильной) с увеличением — чёрных полос от
+#     поворота нет: вместо них из-под углов виден размытый фон
 #   • едва заметный размытый фон-подложка позади видео (полоска 1–3 px)
 #   • лёгкое зерно с рандомным seed, меняется каждый кадр
+#   • medium/strong — невидимые усилители: сдвиг хрома-каналов ±1-2 px
+#     (chromashift), микро-резкость (unsharp), микро-виньетка,
+#     микро-смена скорости ±0.1-0.25% (видео+аудио в синхроне, рвёт и
+#     аудио-отпечатки), микро-изменение громкости
+#   • рандомная структура GOP/B-кадров — разный «скелет» файла
 #   • умное сжатие в 2-3 раза без видимой потери качества (подбор CRF по
 #     пробному куску; если 2-3× недостижимо — жмёт насколько можно)
 #   • полное вычищение метаданных
 
 UNIQ_TARGET_RATIO = 0.40          # цель: ~1/2.5 от исходного размера
 UNIQ_CRF_LADDER = (20, 23, 26)    # от «визуально без потерь» к максимуму
+UNIQ_STRENGTH_KEYS = ("light", "medium", "strong")
+UNIQ_STRENGTH_LABELS = ("Лёгкая", "Средняя", "Сильная")
+
+_filter_support_cache: Dict[str, bool] = {}
 
 
-def _uniq_tint() -> str:
-    """Случайный лёгкий цветной оттенок (colorbalance, величина ~0.02-0.03)."""
-    m = random.uniform(0.015, 0.030)
+def _ffmpeg_filter_supported(ffmpeg_exe: str, name: str) -> bool:
+    """Есть ли в этой сборке ffmpeg фильтр *name* (кэшируется)."""
+    key = ffmpeg_exe + "|" + name
+    if key in _filter_support_cache:
+        return _filter_support_cache[key]
+    ok = False
+    try:
+        r = subprocess.run([ffmpeg_exe, "-hide_banner", "filters"],
+                           capture_output=True, text=True, timeout=20)
+        ok = re.search(rf"\s{name}\s", (r.stdout or "") + (r.stderr or "")) is not None
+    except Exception:
+        ok = False
+    _filter_support_cache[key] = ok
+    return ok
+
+
+def _uniq_tint(mag_range: Tuple[float, float] = (0.015, 0.030)) -> str:
+    """Случайный лёгкий цветной оттенок (colorbalance)."""
+    m = random.uniform(*mag_range)
     presets = [
         {"rs": m, "rm": m * 0.5, "bs": -m, "bm": -m * 0.5},        # тёплый
         {"rs": -m, "rm": -m * 0.5, "bs": m, "bm": m * 0.5},        # холодный
@@ -1186,41 +1211,103 @@ def _uniq_tint() -> str:
     return "colorbalance=" + ":".join(f"{k}={v:.4f}" for k, v in p.items())
 
 
-def build_uniq_filter_chain(w: int, h: int, ten_bit: bool = False,
-                            simple: bool = False) -> str:
-    """Фильтр-цепочка уникализации кадра W×H (каждый вызов — новый рандом).
+def build_uniq_graph(w: int, h: int, ten_bit: bool = False,
+                     simple: bool = False,
+                     strength: str = "medium",
+                     ffmpeg_exe: str = "") -> Tuple[str, str]:
+    """Фильтр-граф уникализации кадра W×H (каждый вызов — новый рандом).
 
-    Вход [0:v], выход [v]. simple=True — запасной вариант без поворота
-    и фона (для экзотических сборок ffmpeg, где rotate+alpha не работает).
+    Возвращает (filter_complex, audio_filter):
+      • filter_complex — вход [0:v], выход [v]
+      • audio_filter   — "" (аудио копируется 1:1) либо микро-цепочка
+        atempo+volume (микро-смена темпа ±0.1-0.25%: рвёт аудио-отпечатки,
+        видео и аудио остаются в синхроне — тот же коэффициент скорости)
+
+    Уровни силы:
+      light  — как раньше: только базовые эффекты, аудио не трогаем
+      medium — + сдвиг хромы ±1px, микро-резкость, микро-виньетка,
+               микро-смена скорости ±0.1%
+      strong — всё то же, но диапазоны шире + скорость ±0.25%
+
+    simple=True — запасной вариант без поворота/фона/хромы/виньетки
+    (совместимость с экзотическими сборками ffmpeg).
     """
+    st = strength if strength in UNIQ_STRENGTH_KEYS else "medium"
     pix = "yuv420p10le" if ten_bit else "yuv420p"
     apix = "yuva420p10le" if ten_bit else "yuva420p"
 
+    # --- диапазоны по силе ---
+    if st == "light":
+        rot_r = (0.20, 0.40); crop_r = (0.012, 0.018); tint_r = (0.012, 0.022)
+        br_r = (0.008, 0.020); gm_r = (0.968, 0.995); ct_r = (1.005, 1.025)
+        sat_r = (0.970, 1.030); hue_r = (1.0, 2.0); noise_all = 1
+        speed_dev = 0.0; chroma_max = 0; vig_r = None; uns_r = None
+    elif st == "strong":
+        rot_r = (0.40, 1.10); crop_r = (0.020, 0.032); tint_r = (0.025, 0.045)
+        br_r = (0.018, 0.040); gm_r = (0.945, 0.985); ct_r = (1.010, 1.045)
+        sat_r = (0.950, 1.050); hue_r = (2.0, 4.0); noise_all = 2
+        speed_dev = 0.0025; chroma_max = 2
+        vig_r = (math.pi / 100.0, math.pi / 70.0); uns_r = (0.10, 0.20)
+    else:  # medium
+        rot_r = (0.30, 0.70); crop_r = (0.015, 0.025); tint_r = (0.018, 0.032)
+        br_r = (0.012, 0.030); gm_r = (0.958, 0.990); ct_r = (1.008, 1.035)
+        sat_r = (0.960, 1.040); hue_r = (1.5, 3.0); noise_all = random.choice((1, 2))
+        speed_dev = 0.0010; chroma_max = 1
+        vig_r = (math.pi / 130.0, math.pi / 90.0); uns_r = (0.05, 0.12)
+
     # --- цветокор: чуть темнее + лёгкий случайный оттенок ---
-    br = -random.uniform(0.008, 0.028)      # лёгкое затемнение
-    gm = random.uniform(0.960, 0.995)       # гамма < 1 — темнее середины
-    ct = random.uniform(1.005, 1.030)       # микро-контраст
-    sat = random.uniform(0.970, 1.030)      # микро-насыщенность
-    hue = random.uniform(1.0, 2.5) * random.choice((-1, 1))
+    br = -random.uniform(*br_r)             # лёгкое затемнение
+    gm = random.uniform(*gm_r)              # гамма < 1 — темнее середины
+    ct = random.uniform(*ct_r)              # микро-контраст
+    sat = random.uniform(*sat_r)            # микро-насыщенность
+    hue = random.uniform(*hue_r) * random.choice((-1, 1))
     eq = (f"eq=brightness={br:.4f}:contrast={ct:.4f}:"
           f"saturation={sat:.4f}:gamma={gm:.4f}")
-    tint = _uniq_tint()
+    tint = _uniq_tint(tint_r)
     seed = random.randint(0, 2 ** 31 - 1)
-    grain = f"noise=alls=1:allf=t+u:all_seed={seed}"
+    grain = f"noise=alls={noise_all}:allf=t+u:all_seed={seed}"
 
-    # --- небольшой кроп по краям (1.2–2.2%) ---
-    cw = int(w * (1.0 - 2 * random.uniform(0.012, 0.022))); cw -= cw % 2
-    ch = int(h * (1.0 - 2 * random.uniform(0.012, 0.022))); ch -= ch % 2
+    # --- невидимые усилители (medium/strong) ---
+    extras = ""
+    if chroma_max > 0 and ffmpeg_exe \
+            and _ffmpeg_filter_supported(ffmpeg_exe, "chromashift"):
+        # сдвиг хрома-каналов на 1-2 px: глазу не видно, отпечаток меняется
+        ch = random.randint(1, chroma_max)
+        ch2 = random.randint(1, chroma_max)
+        extras += (f"chromashift=cbh={random.choice((-ch, ch))}:"
+                   f"cbv={random.choice((-ch2, ch2))}:"
+                   f"crh={random.choice((-ch2, ch2))}:"
+                   f"crv={random.choice((-ch, ch))},")
+    if uns_r is not None:
+        # микро-резкость: меняет частотный отпечаток кадра
+        extras += f"unsharp=5:5:{random.uniform(*uns_r):.3f}:5:5:0.0,"
+    if vig_r is not None:
+        # микро-виньетка: радиальный градиент трогает все пиксели
+        extras += f"vignette={random.uniform(*vig_r):.6f},"
+
+    # --- микро-смена скорости (medium/strong): ±0.1-0.25% ---
+    speed = random.uniform(1.0 - speed_dev, 1.0 + speed_dev) \
+        if speed_dev > 0 else 1.0
+    pts = f"setpts=PTS/{speed:.6f}," if speed != 1.0 else ""
+    audio_filter = ""
+    if speed != 1.0:
+        audio_filter = (f"atempo={speed:.6f},"
+                        f"volume={random.uniform(0.99, 1.01):.4f}")
+
+    # --- небольшой кроп по краям ---
+    cw = int(w * (1.0 - 2 * random.uniform(*crop_r))); cw -= cw % 2
+    ch_ = int(h * (1.0 - 2 * random.uniform(*crop_r))); ch_ -= ch_ % 2
     cx = (w - cw) // 2
-    cy = (h - ch) // 2
+    cy = (h - ch_) // 2
 
     if simple:
-        return (f"[0:v]crop={cw}:{ch}:{cx}:{cy}:exact=1,"
-                f"scale={w}:{h}:flags=bicubic,"
-                f"{eq},{tint},hue=h={hue:.2f},{grain},format={pix}[v]")
+        vf = (f"[0:v]crop={cw}:{ch_}:{cx}:{cy}:exact=1,"
+              f"scale={w}:{h}:flags=bicubic,"
+              f"{eq},{tint},hue=h={hue:.2f},{grain},{pts}format={pix}[v]")
+        return vf, audio_filter
 
-    # --- микроповорот ±0.25–0.6° ---
-    rot = random.uniform(0.25, 0.6) * random.choice((-1, 1))
+    # --- микроповорот ---
+    rot = random.uniform(*rot_r) * random.choice((-1, 1))
     rad = math.radians(rot)
 
     # форграунд возвращается в кадр чуть меньше канваса: по краям остаётся
@@ -1236,16 +1323,17 @@ def build_uniq_filter_chain(w: int, h: int, ten_bit: bool = False,
     ox = (w - fw) // 2
     oy = (h - fh) // 2
 
-    return (
+    vf = (
         f"[0:v]split=2[ubgS][ufgS];"
         f"[ubgS]scale={bw}:{bh}:force_original_aspect_ratio=increase:"
         f"flags=bicubic,crop={w}:{h}:exact=1,boxblur=20:2,"
         f"eq=brightness=-0.06:saturation=1.06[ubg];"
-        f"[ufgS]crop={cw}:{ch}:{cx}:{cy}:exact=1,format={apix},"
+        f"[ufgS]crop={cw}:{ch_}:{cx}:{cy}:exact=1,format={apix},"
         f"rotate={rad:.6f}:c=0x00000000,scale={fw}:{fh}:flags=bicubic[ufg];"
         f"[ubg][ufg]overlay={ox}:{oy}:shortest=1,"
-        f"{eq},{tint},hue=h={hue:.2f},{grain},format={pix}[v]"
+        f"{extras}{eq},{tint},hue=h={hue:.2f},{grain},{pts}format={pix}[v]"
     )
+    return vf, audio_filter
 
 
 def _audio_is_aac(path: str, ffmpeg_exe: str) -> bool:
@@ -1305,11 +1393,13 @@ def _uniq_pick_crf(src: str, ffmpeg_exe: str, chain: str, duration: float,
 
 
 def uniquify_file(src: str, dst: str, ffmpeg_exe: str,
-                  ten_bit: Optional[bool] = None) -> Tuple[bool, str]:
+                  ten_bit: Optional[bool] = None,
+                  strength: str = "medium") -> Tuple[bool, str]:
     """Уникализация + сжатие ×2-3: src → dst одним перекодом.
 
     ten_bit=None — определить 10-битность исходника автоматически.
-    Метаданные вычищаются полностью.
+    strength — light / medium / strong (диапазоны эффектов, см.
+    build_uniq_graph). Метаданные вычищаются полностью.
     """
     if not os.path.isfile(src):
         return False, f"нет файла: {src}"
@@ -1324,22 +1414,33 @@ def uniquify_file(src: str, dst: str, ffmpeg_exe: str,
         use10 = bool(info.get("ten_bit")) if ten_bit is None else bool(ten_bit)
         pix = "yuv420p10le" if use10 else "yuv420p"
 
-        chain = build_uniq_filter_chain(w, h, ten_bit=use10)
+        chain, audio_filter = build_uniq_graph(
+            w, h, ten_bit=use10, strength=strength, ffmpeg_exe=ffmpeg_exe)
         crf = _uniq_pick_crf(src, ffmpeg_exe, chain,
                              float(info.get("duration") or 0.0), use10)
 
-        def encode(vf_chain: str, crf_v: int) -> Tuple[bool, str]:
+        # рандомная структура GOP/B-кадров — разный «скелет» файла у каждой
+        # сборки (на качество и размер не влияет)
+        gop = str(random.randint(90, 240))
+        bframes = str(random.randint(2, 4))
+
+        def encode(vf_chain: str, af: str, crf_v: int) -> Tuple[bool, str]:
             cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
                    "-i", src, "-filter_complex", vf_chain, "-map", "[v]",
                    "-map", "0:a?",
                    "-c:v", "libx264", "-preset", "medium",
-                   "-crf", str(crf_v), "-pix_fmt", pix]
+                   "-crf", str(crf_v), "-pix_fmt", pix,
+                   "-g", gop, "-bf", bframes]
             if use10:
                 cmd += ["-profile:v", "high10",
                         "-x264-params",
                         "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
             if info.get("audio"):
-                if _audio_is_aac(src, ffmpeg_exe):
+                if af:
+                    # микро-смена темпа/громкости — рвёт аудио-отпечатки
+                    cmd += ["-af", af, "-c:a", "aac", "-b:a", "256k",
+                            "-ar", "44100", "-ac", "2"]
+                elif _audio_is_aac(src, ffmpeg_exe):
                     cmd += ["-c:a", "copy"]          # аудио без потерь
                 else:
                     cmd += ["-c:a", "aac", "-b:a", "256k",
@@ -1360,21 +1461,24 @@ def uniquify_file(src: str, dst: str, ffmpeg_exe: str,
                 return True, ""
             return False, (r.stderr or b"").decode("utf-8", "replace")[-800:]
 
-        ok, err = encode(chain, crf)
+        ok, err = encode(chain, audio_filter, crf)
         if not ok:
             # запасной вариант: тот же цветокор/кроп/зерно, но без
-            # поворота и фона (совместимость с любыми сборками ffmpeg)
-            chain2 = build_uniq_filter_chain(w, h, ten_bit=use10, simple=True)
-            ok, err = encode(chain2, crf)
+            # поворота, фона, хромы и виньетки (совместимость с любыми
+            # сборками ffmpeg)
+            chain2, audio_filter2 = build_uniq_graph(
+                w, h, ten_bit=use10, simple=True, strength=strength)
+            ok, err = encode(chain2, audio_filter2, crf)
         return ok, err
     except Exception as e:
         return False, str(e)
 
 
-def uniquify_final_video(path: str, ffmpeg_exe: str) -> Tuple[bool, str]:
+def uniquify_final_video(path: str, ffmpeg_exe: str,
+                         strength: str = "medium") -> Tuple[bool, str]:
     """Уникализация файла на месте (tmp + атомарная замена)."""
     tmp = path + ".uniq.mp4"
-    ok, err = uniquify_file(path, tmp, ffmpeg_exe)
+    ok, err = uniquify_file(path, tmp, ffmpeg_exe, strength=strength)
     if ok:
         try:
             os.replace(tmp, path)
@@ -3732,6 +3836,20 @@ class ExportCard(SidebarCard):
         s2._inner.addWidget(self.chk_econ)
         s2._inner.addWidget(self.chk_final_uniq)
 
+        uniq_row = QHBoxLayout()
+        lbl = QLabel("Сила уника:")
+        uniq_row.addWidget(lbl)
+        self.uniq_strength_combo = QComboBox()
+        self.uniq_strength_combo.addItems(list(UNIQ_STRENGTH_LABELS))
+        self.uniq_strength_combo.setCurrentIndex(1)      # средняя
+        self.uniq_strength_combo.setToolTip(
+            "Лёгкая — базовые эффекты, аудио копируется 1:1.\n"
+            "Средняя — + сдвиг хромы, микро-резкость, микро-виньетка,\n"
+            "микро-смена скорости ±0.1% (рвёт и аудио-отпечатки).\n"
+            "Сильная — всё то же, но диапазоны шире + скорость ±0.25%.")
+        uniq_row.addWidget(self.uniq_strength_combo, 1)
+        s2._inner.addLayout(uniq_row)
+
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
         self.out_label = QLabel(truncate_middle(OUTPUT_DIR, 34))
@@ -3746,6 +3864,7 @@ class ExportCard(SidebarCard):
         s3._inner.addLayout(orow)
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
                   self.chk_econ, self.chk_final_uniq):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
@@ -3769,6 +3888,9 @@ class ExportCard(SidebarCard):
             "blur_fill": self.chk_blur.isChecked(),
             "econ": self.chk_econ.isChecked(),
             "final_uniq": self.chk_final_uniq.isChecked(),
+            "uniq_strength": UNIQ_STRENGTH_KEYS[
+                min(max(self.uniq_strength_combo.currentIndex(), 0),
+                    len(UNIQ_STRENGTH_KEYS) - 1)],
             "crf": q["crf"],
             "preset": q["preset"],
             "quality_text": q["label"],
@@ -3778,6 +3900,7 @@ class ExportCard(SidebarCard):
         if not isinstance(cfg, dict):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
                   self.chk_econ, self.chk_final_uniq):
             w.blockSignals(True)
@@ -3805,7 +3928,14 @@ class ExportCard(SidebarCard):
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
         if "final_uniq" in cfg: self.chk_final_uniq.setChecked(bool(cfg["final_uniq"]))
+        if "uniq_strength" in cfg:
+            try:
+                i = list(UNIQ_STRENGTH_KEYS).index(str(cfg["uniq_strength"]))
+                self.uniq_strength_combo.setCurrentIndex(i)
+            except ValueError:
+                pass
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
                   self.chk_econ, self.chk_final_uniq):
             w.blockSignals(False)
@@ -4554,7 +4684,8 @@ class BuildWorker(QThread):
             # ---- 🧬 уник финала: цветокор + кроп + поворот + фон + сжатие
             if exp.get("final_uniq", False):
                 self.progress.emit(90, "🧬 Уник финала: цветокор + поворот + сжатие…")
-                uok, uerr = uniquify_final_video(out_path, ff)
+                uok, uerr = uniquify_final_video(
+                    out_path, ff, strength=exp.get("uniq_strength", "medium"))
                 if not uok:
                     # уник не должен ронять сборку — оставляем оригинал
                     print(f"[uniq] {out_path}: {uerr}")
@@ -4715,7 +4846,8 @@ class BatchBuildWorker(QThread):
                     return None
                 # ---- 🧬 уник финала (тот же, что в одиночной сборке)
                 if exp.get("final_uniq", False):
-                    uok, uerr = uniquify_final_video(out_path, ff)
+                    uok, uerr = uniquify_final_video(
+                        out_path, ff, strength=exp.get("uniq_strength", "medium"))
                     if not uok:
                         print(f"[batch][uniq] {out_name}: {uerr}")
                 handle_used(vp)

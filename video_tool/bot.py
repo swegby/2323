@@ -244,6 +244,19 @@ def body_pools() -> List[List[str]]:
     return [list_videos(d) for d in FOLDER_DIRS[1:]]
 
 
+def uniq_strength() -> str:
+    """Сила уника из project.json (настраивается в GUI: Экспорт → Сила уника).
+
+    По умолчанию — средняя.
+    """
+    try:
+        st = str((load_project().get("export") or {}).get("uniq_strength")
+                 or "medium")
+        return st if st in ("light", "medium", "strong") else "medium"
+    except Exception:
+        return "medium"
+
+
 # ======================================================================
 #  ПАРСИНГ ДЛИТЕЛЬНОСТЕЙ (точность до миллисекунд)
 # ======================================================================
@@ -436,7 +449,8 @@ def process_hook_only(src: str, out_path: str, ffmpeg_exe: str,
     """
     try:
         if micro_uniq:
-            return uniquify_file(src, out_path, ffmpeg_exe)
+            return uniquify_file(src, out_path, ffmpeg_exe,
+                                 strength=uniq_strength())
         # ---- без уника: remux без перекода видео (качество 1:1).
         # аудио copy только если это AAC — иначе (PCM/ALAC из MOV)
         # конвертим в AAC, чтобы mp4 играли все плееры/платформы.
@@ -795,7 +809,8 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                     #      микроповорот + фон + зерно + сжатие ×2-3
                     #      (один перекод, метаданные вычищаются внутри)
                     if micro_uniq:
-                        uok, uerr = uniquify_final_video(out_path, ff)
+                        uok, uerr = uniquify_final_video(
+                            out_path, ff, strength=uniq_strength())
                         if not uok:
                             errors.append(f"«{folder_name}» #{i + 1}: "
                                           f"уник не удался ({uerr[:80]})")
@@ -983,7 +998,8 @@ def ask_uniq(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
             "• еле заметный размытый фон-подложка позади + лёгкое зерно\n"
             "• сжатие в 2-3 раза без видимой потери качества\n\n"
             "Хэш и цифровой отпечаток у каждого файла разные — для "
-            "Instagram/TikTok это уникальный контент:",
+            "Instagram/TikTok это уникальный контент.\n"
+            "Сила уника берётся из настроек GUI (Экспорт → Сила уника):",
             kb_yes_no("uniq", yes, "📄 Нет, без уника"))
 
 
