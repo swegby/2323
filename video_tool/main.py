@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.6"
+APP_VERSION = "v2.7"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1150,6 +1150,246 @@ def _micro_uniq_chain(canvas_w: int, canvas_h: int) -> str:
         f"hue=h={hue:.3f},"
         f"noise=alls=1:allf=t:all_seed={seed},"
     )
+
+
+# ======================================================================
+#  FINAL UNIQ — нормальная уникализация собранного ролика
+# ======================================================================
+# Один пост-проход по уже собранному файлу (работает и в одиночной сборке,
+# и в батче, и во всех режимах бота):
+#   • цветокор: лёгкое затемнение + случайный оттенок (тёплый/холодный/
+#     пурпурный/зелёный/teal-orange), микро-гамма/контраст/насыщенность/hue
+#   • небольшой кроп по краям (1.2–2.2%) с масштабом обратно в полный кадр
+#   • микроповорот ±0.25–0.6° с увеличением — чёрных полос от поворота нет:
+#     вместо них из-под углов еле заметно выглядывает размытый фон
+#   • едва заметный размытый фон-подложка позади видео (полоска 1–3 px)
+#   • лёгкое зерно с рандомным seed, меняется каждый кадр
+#   • умное сжатие в 2-3 раза без видимой потери качества (подбор CRF по
+#     пробному куску; если 2-3× недостижимо — жмёт насколько можно)
+#   • полное вычищение метаданных
+
+UNIQ_TARGET_RATIO = 0.40          # цель: ~1/2.5 от исходного размера
+UNIQ_CRF_LADDER = (20, 23, 26)    # от «визуально без потерь» к максимуму
+
+
+def _uniq_tint() -> str:
+    """Случайный лёгкий цветной оттенок (colorbalance, величина ~0.02-0.03)."""
+    m = random.uniform(0.015, 0.030)
+    presets = [
+        {"rs": m, "rm": m * 0.5, "bs": -m, "bm": -m * 0.5},        # тёплый
+        {"rs": -m, "rm": -m * 0.5, "bs": m, "bm": m * 0.5},        # холодный
+        {"rs": m, "bs": m, "gs": -m * 0.7},                        # пурпурный
+        {"gs": m * 0.8, "rs": -m * 0.6, "bs": -m * 0.6},           # зелёный
+        {"rs": m, "bs": -m, "gm": m * 0.35},                       # teal & orange
+    ]
+    p = random.choice(presets)
+    return "colorbalance=" + ":".join(f"{k}={v:.4f}" for k, v in p.items())
+
+
+def build_uniq_filter_chain(w: int, h: int, ten_bit: bool = False,
+                            simple: bool = False) -> str:
+    """Фильтр-цепочка уникализации кадра W×H (каждый вызов — новый рандом).
+
+    Вход [0:v], выход [v]. simple=True — запасной вариант без поворота
+    и фона (для экзотических сборок ffmpeg, где rotate+alpha не работает).
+    """
+    pix = "yuv420p10le" if ten_bit else "yuv420p"
+    apix = "yuva420p10le" if ten_bit else "yuva420p"
+
+    # --- цветокор: чуть темнее + лёгкий случайный оттенок ---
+    br = -random.uniform(0.008, 0.028)      # лёгкое затемнение
+    gm = random.uniform(0.960, 0.995)       # гамма < 1 — темнее середины
+    ct = random.uniform(1.005, 1.030)       # микро-контраст
+    sat = random.uniform(0.970, 1.030)      # микро-насыщенность
+    hue = random.uniform(1.0, 2.5) * random.choice((-1, 1))
+    eq = (f"eq=brightness={br:.4f}:contrast={ct:.4f}:"
+          f"saturation={sat:.4f}:gamma={gm:.4f}")
+    tint = _uniq_tint()
+    seed = random.randint(0, 2 ** 31 - 1)
+    grain = f"noise=alls=1:allf=t+u:all_seed={seed}"
+
+    # --- небольшой кроп по краям (1.2–2.2%) ---
+    cw = int(w * (1.0 - 2 * random.uniform(0.012, 0.022))); cw -= cw % 2
+    ch = int(h * (1.0 - 2 * random.uniform(0.012, 0.022))); ch -= ch % 2
+    cx = (w - cw) // 2
+    cy = (h - ch) // 2
+
+    if simple:
+        return (f"[0:v]crop={cw}:{ch}:{cx}:{cy}:exact=1,"
+                f"scale={w}:{h}:flags=bicubic,"
+                f"{eq},{tint},hue=h={hue:.2f},{grain},format={pix}[v]")
+
+    # --- микроповорот ±0.25–0.6° ---
+    rot = random.uniform(0.25, 0.6) * random.choice((-1, 1))
+    rad = math.radians(rot)
+
+    # форграунд возвращается в кадр чуть меньше канваса: по краям остаётся
+    # еле заметная полоска фона (1–3 px)
+    inset = random.randint(1, 3)
+    fw = w - 2 * inset
+    fh = h - 2 * inset
+
+    # --- фон позади: увеличенная размытая копия самого видео ---
+    z = random.uniform(1.10, 1.18)
+    bw = int(w * z); bw += bw % 2
+    bh = int(h * z); bh += bh % 2
+    ox = (w - fw) // 2
+    oy = (h - fh) // 2
+
+    return (
+        f"[0:v]split=2[ubgS][ufgS];"
+        f"[ubgS]scale={bw}:{bh}:force_original_aspect_ratio=increase:"
+        f"flags=bicubic,crop={w}:{h}:exact=1,boxblur=20:2,"
+        f"eq=brightness=-0.06:saturation=1.06[ubg];"
+        f"[ufgS]crop={cw}:{ch}:{cx}:{cy}:exact=1,format={apix},"
+        f"rotate={rad:.6f}:c=0x00000000,scale={fw}:{fh}:flags=bicubic[ufg];"
+        f"[ubg][ufg]overlay={ox}:{oy}:shortest=1,"
+        f"{eq},{tint},hue=h={hue:.2f},{grain},format={pix}[v]"
+    )
+
+
+def _audio_is_aac(path: str, ffmpeg_exe: str) -> bool:
+    try:
+        r = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", path],
+                           capture_output=True, text=True, timeout=30)
+        return bool(re.search(r"Audio:\s*aac\b", r.stderr or ""))
+    except Exception:
+        return False
+
+
+def _uniq_pick_crf(src: str, ffmpeg_exe: str, chain: str, duration: float,
+                   ten_bit: bool) -> int:
+    """Подбор CRF для сжатия ×2-3: короткая проба середины ролика.
+
+    Возвращает первый CRF из лестницы, дающий ~UNIQ_TARGET_RATIO от
+    исходного битрейта. Если 2-3× недостижимо — жмёт настолько, насколько
+    можно без заметной потери качества.
+    """
+    try:
+        size = os.path.getsize(src)
+        if size <= 0 or duration <= 0:
+            return 21
+        in_br = size * 8.0 / duration            # бит/с исходника
+        t = min(4.0, max(1.5, duration / 3.0))
+        ss = max(0.0, duration / 2.0 - t / 2.0)
+        pix = "yuv420p10le" if ten_bit else "yuv420p"
+        tmp = os.path.join(OUTPUT_DIR, f"_uniq_probe_{uuid.uuid4().hex[:8]}.mp4")
+        ratio_last: Optional[float] = None
+        for crf in UNIQ_CRF_LADDER:
+            try:
+                cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                       "-ss", f"{ss:.3f}", "-t", f"{t:.3f}", "-i", src,
+                       "-filter_complex", chain, "-map", "[v]", "-an",
+                       "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", str(crf), "-pix_fmt", pix, tmp]
+                r = subprocess.run(cmd, capture_output=True, timeout=180)
+                if r.returncode != 0 or not os.path.isfile(tmp):
+                    return 21
+                ratio = (os.path.getsize(tmp) * 8.0 / t) / in_br
+                if ratio <= UNIQ_TARGET_RATIO:
+                    return crf
+                if crf == UNIQ_CRF_LADDER[-1]:
+                    ratio_last = ratio
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        # цели 2-3× не достигли: если максимум лестницы даёт хоть что-то
+        # (~1.8×) — берём его, иначе щадящий CRF 23
+        if ratio_last is not None and ratio_last <= 0.55:
+            return UNIQ_CRF_LADDER[-1]
+        return 23
+    except Exception:
+        return 21
+
+
+def uniquify_file(src: str, dst: str, ffmpeg_exe: str,
+                  ten_bit: Optional[bool] = None) -> Tuple[bool, str]:
+    """Уникализация + сжатие ×2-3: src → dst одним перекодом.
+
+    ten_bit=None — определить 10-битность исходника автоматически.
+    Метаданные вычищаются полностью.
+    """
+    if not os.path.isfile(src):
+        return False, f"нет файла: {src}"
+    try:
+        info = _probe(src, ffmpeg_exe)
+        w = int(info.get("w") or 0)
+        h = int(info.get("h") or 0)
+        if w < 16 or h < 16:
+            return False, "не смог определить размер видео"
+        w -= w % 2
+        h -= h % 2
+        use10 = bool(info.get("ten_bit")) if ten_bit is None else bool(ten_bit)
+        pix = "yuv420p10le" if use10 else "yuv420p"
+
+        chain = build_uniq_filter_chain(w, h, ten_bit=use10)
+        crf = _uniq_pick_crf(src, ffmpeg_exe, chain,
+                             float(info.get("duration") or 0.0), use10)
+
+        def encode(vf_chain: str, crf_v: int) -> Tuple[bool, str]:
+            cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                   "-i", src, "-filter_complex", vf_chain, "-map", "[v]",
+                   "-map", "0:a?",
+                   "-c:v", "libx264", "-preset", "medium",
+                   "-crf", str(crf_v), "-pix_fmt", pix]
+            if use10:
+                cmd += ["-profile:v", "high10",
+                        "-x264-params",
+                        "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
+            if info.get("audio"):
+                if _audio_is_aac(src, ffmpeg_exe):
+                    cmd += ["-c:a", "copy"]          # аудио без потерь
+                else:
+                    cmd += ["-c:a", "aac", "-b:a", "256k",
+                            "-ar", "44100", "-ac", "2"]
+            # полное вычищение метаданных
+            cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
+                    "-fflags", "+bitexact", "-flags:v", "+bitexact",
+                    "-flags:a", "+bitexact",
+                    "-metadata:s:v", "handler_name=",
+                    "-metadata:s:a", "handler_name=",
+                    "-movflags", "+faststart", dst]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=3600)
+            except subprocess.TimeoutExpired:
+                return False, "timeout"
+            if r.returncode == 0 and os.path.isfile(dst) \
+                    and os.path.getsize(dst) > 1024:
+                return True, ""
+            return False, (r.stderr or b"").decode("utf-8", "replace")[-800:]
+
+        ok, err = encode(chain, crf)
+        if not ok:
+            # запасной вариант: тот же цветокор/кроп/зерно, но без
+            # поворота и фона (совместимость с любыми сборками ffmpeg)
+            chain2 = build_uniq_filter_chain(w, h, ten_bit=use10, simple=True)
+            ok, err = encode(chain2, crf)
+        return ok, err
+    except Exception as e:
+        return False, str(e)
+
+
+def uniquify_final_video(path: str, ffmpeg_exe: str) -> Tuple[bool, str]:
+    """Уникализация файла на месте (tmp + атомарная замена)."""
+    tmp = path + ".uniq.mp4"
+    ok, err = uniquify_file(path, tmp, ffmpeg_exe)
+    if ok:
+        try:
+            os.replace(tmp, path)
+            return True, ""
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False, str(e)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False, err
 
 
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
@@ -3476,11 +3716,21 @@ class ExportCard(SidebarCard):
                                  "размытой копией вместо жёсткого кропа — контент не теряется.")
         self.chk_econ = QCheckBox("Эконом (без превью)")
         self.chk_econ.setToolTip("Не грузить видео в превью — экономия RAM при 1000+ видео")
+        self.chk_final_uniq = QCheckBox("🧬 Уник финала + сжатие ×2-3")
+        self.chk_final_uniq.setChecked(True)
+        self.chk_final_uniq.setToolTip(
+            "Пост-обработка собранного видео (работает и в одиночной сборке, и в батче):\n"
+            "• цветокор — лёгкое затемнение + случайный оттенок\n"
+            "• небольшой кроп по краям (1-2%) и микроповорот без чёрных полос\n"
+            "• еле заметный размытый фон-подложка позади и лёгкое зерно\n"
+            "• сжатие в 2-3 раза без видимой потери качества (умный подбор CRF)\n"
+            "• метаданные вычищаются полностью")
         s2._inner.addWidget(self.chk_audio)
         s2._inner.addWidget(self.chk_caps)
         s2._inner.addWidget(self.chk_tenbit)
         s2._inner.addWidget(self.chk_blur)
         s2._inner.addWidget(self.chk_econ)
+        s2._inner.addWidget(self.chk_final_uniq)
 
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
@@ -3497,7 +3747,7 @@ class ExportCard(SidebarCard):
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
                 else w.toggled.connect(self._changed)
 
@@ -3518,6 +3768,7 @@ class ExportCard(SidebarCard):
             "ten_bit": self.chk_tenbit.isChecked(),
             "blur_fill": self.chk_blur.isChecked(),
             "econ": self.chk_econ.isChecked(),
+            "final_uniq": self.chk_final_uniq.isChecked(),
             "crf": q["crf"],
             "preset": q["preset"],
             "quality_text": q["label"],
@@ -3528,7 +3779,7 @@ class ExportCard(SidebarCard):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.blockSignals(True)
         if "resolution_index" in cfg:
             self.res_combo.setCurrentIndex(
@@ -3553,9 +3804,10 @@ class ExportCard(SidebarCard):
         if "ten_bit" in cfg: self.chk_tenbit.setChecked(bool(cfg["ten_bit"]))
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
+        if "final_uniq" in cfg: self.chk_final_uniq.setChecked(bool(cfg["final_uniq"]))
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.blockSignals(False)
 
 # ======================================================================
@@ -4299,6 +4551,13 @@ class BuildWorker(QThread):
                 if not ok2:
                     self.failed.emit(f"Ошибка: {err}\nMoviePy: {err2}")
                     return
+            # ---- 🧬 уник финала: цветокор + кроп + поворот + фон + сжатие
+            if exp.get("final_uniq", False):
+                self.progress.emit(90, "🧬 Уник финала: цветокор + поворот + сжатие…")
+                uok, uerr = uniquify_final_video(out_path, ff)
+                if not uok:
+                    # уник не должен ронять сборку — оставляем оригинал
+                    print(f"[uniq] {out_path}: {uerr}")
             self.progress.emit(97, "Готово")
             self.file_done.emit(out_path)
             self.finished_ok.emit(out_path)
@@ -4454,6 +4713,11 @@ class BatchBuildWorker(QThread):
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
                     return None
+                # ---- 🧬 уник финала (тот же, что в одиночной сборке)
+                if exp.get("final_uniq", False):
+                    uok, uerr = uniquify_final_video(out_path, ff)
+                    if not uok:
+                        print(f"[batch][uniq] {out_name}: {uerr}")
                 handle_used(vp)
                 # Telegram auto-send is handled on the GUI thread via
                 # file_done -> MainWindow.auto_send_file (auto-migrates chat id)

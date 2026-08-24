@@ -98,6 +98,7 @@ from main import (
     load_project, load_characters, save_characters,
     get_ffmpeg_exe, is_valid_ffmpeg, get_video_duration,
     build_one_final_ffmpeg, build_segment_ffmpeg, download_fonts,
+    uniquify_file, uniquify_final_video,
     FONT_ANTON, FONT_OSWALD,
 )
 
@@ -364,8 +365,9 @@ def summary_text(s: Dict[str, Any]) -> str:
     names = [name for _p, name in s["folders"]]
     total = s["count"] * len(names)
     if s.get("parts_mode"):
-        uniq_line = ("🧬 Микро-уник: <b>да (невидимый рандом)</b>"
-                     if s.get("micro_uniq") else "🧬 Микро-уник: <b>нет</b>")
+        uniq_line = ("🧬 Уник: <b>да — цветокор + кроп + поворот + фон + "
+                     "зерно, сжатие ×2-3</b>"
+                     if s.get("micro_uniq") else "🧬 Уник: <b>нет</b>")
         n = s["count"]
         total_files = n * (len(names) + len(FOLDER_DIRS) - 1)
         return "\n".join([
@@ -382,8 +384,9 @@ def summary_text(s: Dict[str, Any]) -> str:
             "💎 Отправка: <b>документом, без сжатия</b>",
         ])
     if s.get("hooks_only"):
-        uniq_line = ("🧬 Микро-уник: <b>да (невидимый рандом)</b>"
-                     if s.get("micro_uniq") else "🧬 Микро-уник: <b>нет</b>")
+        uniq_line = ("🧬 Уник: <b>да — цветокор + кроп + поворот + фон + "
+                     "зерно, сжатие ×2-3</b>"
+                     if s.get("micro_uniq") else "🧬 Уник: <b>нет</b>")
         return "\n".join([
             "<b>📋 Заказ — только хуки</b>",
             f"📁 Папки: <b>{', '.join(names)}</b>",
@@ -400,9 +403,10 @@ def summary_text(s: Dict[str, Any]) -> str:
                      "(не ускоряется/не режется)")
     else:
         hook_line = "🎬 Хук без изменений: <b>нет, подгоняется под длительность</b>"
-    uniq_line = ("🧬 Микро-уник папок 2-5: <b>да (невидимый рандом)</b>"
+    uniq_line = ("🧬 Уник всего видео: <b>да — цветокор + кроп + поворот + "
+                 "фон + зерно, сжатие ×2-3</b>"
                  if s.get("micro_uniq")
-                 else "🧬 Микро-уник папок 2-5: <b>нет</b>")
+                 else "🧬 Уник всего видео: <b>нет</b>")
     return "\n".join([
         "<b>📋 Заказ</b>",
         f"📁 Папки (хуки): <b>{', '.join(names)}</b>",
@@ -424,32 +428,15 @@ def summary_text(s: Dict[str, Any]) -> str:
 
 def process_hook_only(src: str, out_path: str, ffmpeg_exe: str,
                       micro_uniq: bool) -> Tuple[bool, str]:
-    """«Только хуки»: видео целиком, без надписей и склейки.
+    """«Только хуки»/«фрагменты»: видео целиком, без надписей и склейки.
 
-    Без уника — remux copy в mp4 (качество 1:1). С уником — один
-    качественный перекод (CRF 16) с невидимым рандомом.
+    Без уника — remux copy в mp4 (качество 1:1). С уником — один перекод
+    с полной уникализацией (цветокор + кроп + микроповорот + фон + зерно)
+    и умным сжатием ×2-3 без видимой потери качества.
     """
     try:
         if micro_uniq:
-            from main import _probe, _micro_uniq_chain
-            info = _probe(src, ffmpeg_exe)
-            w = int(info.get("w") or 0) or 1080
-            h = int(info.get("h") or 0) or 1920
-            # чётные размеры для yuv420p
-            w -= w % 2
-            h -= h % 2
-            chain = _micro_uniq_chain(w, h).rstrip(",")
-            cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-                   "-i", src, "-vf", chain,
-                   "-c:v", "libx264", "-preset", "medium", "-crf", "16",
-                   "-pix_fmt", "yuv420p",
-                   "-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2",
-                   "-movflags", "+faststart", out_path]
-            r = subprocess.run(cmd, capture_output=True, timeout=1800)
-            if r.returncode == 0 and os.path.isfile(out_path) \
-                    and os.path.getsize(out_path) > 1024:
-                return True, ""
-            return False, r.stderr.decode("utf-8", "replace")[-300:]
+            return uniquify_file(src, out_path, ffmpeg_exe)
         # ---- без уника: remux без перекода видео (качество 1:1).
         # аудио copy только если это AAC — иначе (PCM/ALAC из MOV)
         # конвертим в AAC, чтобы mp4 играли все плееры/платформы.
@@ -604,7 +591,9 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                     if not ok:
                         errors.append(f"{label} #{i}: {err[:100]}")
                         continue
-                    clean_metadata(out_path, ff)
+                    if not micro_uniq:
+                        # с уником метаданные уже вычищены при перекоде
+                        clean_metadata(out_path, ff)
                     hd = get_video_duration(out_path, ff)
                     sent_files.append((out_path, hd))
                     total_made += 1
@@ -706,7 +695,9 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                             errors.append(f"«{folder_name}» #{i + 1}: "
                                           f"{err[:100]}")
                             continue
-                        clean_metadata(out_path, ff)
+                        if not micro_uniq:
+                            # с уником метаданные уже вычищены при перекоде
+                            clean_metadata(out_path, ff)
                         hd = get_video_duration(out_path, ff)
                         ready.append((out_path, [round(hd, 3)]))
                         total_made += 1
@@ -795,13 +786,23 @@ def run_order(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
                         ten_bit=ten_bit, blur_fill=blur_fill,
                         audio_kbps=256,
                         random_flags=None, preset_indices=None,
-                        micro_uniq=micro_uniq)
+                        micro_uniq=False)
                     if not ok:
                         errors.append(f"«{folder_name}» #{i + 1}: {err[:100]}")
                         continue
 
-                    # ---- 🧹 полная очистка метаданных (без потери качества)
-                    clean_metadata(out_path, ff)
+                    # ---- 🧬 уник ВСЕГО готового видео: цветокор + кроп +
+                    #      микроповорот + фон + зерно + сжатие ×2-3
+                    #      (один перекод, метаданные вычищаются внутри)
+                    if micro_uniq:
+                        uok, uerr = uniquify_final_video(out_path, ff)
+                        if not uok:
+                            errors.append(f"«{folder_name}» #{i + 1}: "
+                                          f"уник не удался ({uerr[:80]})")
+                            clean_metadata(out_path, ff)
+                    else:
+                        # ---- 🧹 полная очистка метаданных (без потери качества)
+                        clean_metadata(out_path, ff)
                     ready.append((out_path, cur_durs))
                     total_made += 1
 
@@ -966,20 +967,23 @@ def save_incoming_video(tg: Tg, chat_id: int, s: Dict[str, Any],
 def ask_uniq(tg: Tg, chat_id: int, s: Dict[str, Any]) -> None:
     s["state"] = "wait_uniq"
     if s.get("hooks_only"):
-        title = "🧬 <b>Микро-уник хуков?</b>"
-        yes = "🧬 Да, уникализировать хуки"
+        title = "🧬 <b>Уникализировать хуки?</b>"
+        yes = "🧬 Да, уник + сжатие"
     elif s.get("parts_mode"):
-        title = "🧬 <b>Микро-уник фрагментов?</b>"
-        yes = "🧬 Да, уникализировать все фрагменты"
+        title = "🧬 <b>Уникализировать все фрагменты?</b>"
+        yes = "🧬 Да, уник + сжатие"
     else:
-        title = "🧬 <b>Микро-уник папок 2-5?</b>"
-        yes = "🧬 Да, уникализировать (сегменты 2-5)"
+        title = "🧬 <b>Уникализировать готовые видео?</b>"
+        yes = "🧬 Да, уник + сжатие"
     tg.send(chat_id,
             f"{title}\n"
-            "Каждое видео получает невидимый глазу рандом: сдвиг пикселей "
-            "меньше 0.5%, микро-яркость/контраст/оттенок, лёгкое зерно. "
-            "Хэш и цифровой отпечаток у каждого ролика будут разными — "
-            "для Instagram/TikTok это уникальный контент:",
+            "Каждый ролик после сборки получает:\n"
+            "• лёгкий цветокор — чуть темнее + случайный оттенок\n"
+            "• небольшой кроп по краям и микроповорот без чёрных полос\n"
+            "• еле заметный размытый фон-подложка позади + лёгкое зерно\n"
+            "• сжатие в 2-3 раза без видимой потери качества\n\n"
+            "Хэш и цифровой отпечаток у каждого файла разные — для "
+            "Instagram/TikTok это уникальный контент:",
             kb_yes_no("uniq", yes, "📄 Нет, без уника"))
 
 
