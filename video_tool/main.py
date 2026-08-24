@@ -1220,25 +1220,27 @@ def _uniq_look_chain(mag: float = 1.0) -> str:
     явно меняется (как фильтр из CapCut), но остаётся нормальной на вид.
     mag — общая сила (0.85-1.3 со случайным джиттером).
     """
-    m = random.uniform(0.85, 1.25) * mag
+    m = random.uniform(0.8, 1.15) * mag
     looks = [
         # (colorbalance: rs gs bs rm gm bm, contrast, saturation, gamma, curves)
-        dict(cb=(0.10, 0.00, -0.10, 0.06, 0.00, -0.05), ct=1.06, sat=1.10, g=0.97, cv="increase_contrast"),   # тёплый плёночный
-        dict(cb=(-0.08, 0.00, 0.10, -0.05, 0.00, 0.05), ct=1.08, sat=0.96, g=0.97, cv="medium_contrast"),     # холодный кино
-        dict(cb=(-0.10, 0.03, 0.10, 0.12, 0.00, -0.08), ct=1.05, sat=1.12, g=0.98, cv="increase_contrast"),   # teal & orange
-        dict(cb=(0.04, 0.00, 0.03, 0.03, 0.00, 0.02), ct=1.14, sat=1.22, g=1.03, cv="linear_contrast"),       # яркий
-        dict(cb=(0.09, 0.02, -0.07, 0.05, 0.01, -0.04), ct=0.97, sat=0.92, g=1.02, cv="vintage"),             # матовый винтаж
-        dict(cb=(-0.04, 0.00, 0.04, 0.00, 0.00, 0.00), ct=1.18, sat=0.84, g=0.95, cv="strong_contrast"),      # мрачный контраст
+        dict(cb=(0.04, 0.00, -0.04, 0.025, 0.00, -0.02), ct=1.02, sat=1.04, g=0.99, cv=None),                  # тёплый плёночный
+        dict(cb=(-0.035, 0.00, 0.04, -0.02, 0.00, 0.02), ct=1.025, sat=0.98, g=0.99, cv=None),                 # холодный кино
+        dict(cb=(-0.04, 0.015, 0.04, 0.045, 0.00, -0.03), ct=1.02, sat=1.04, g=0.99, cv=None),                 # teal & orange
+        dict(cb=(0.02, 0.00, 0.015, 0.015, 0.00, 0.01), ct=1.04, sat=1.07, g=1.015, cv="lighter"),             # яркий
+        dict(cb=(0.04, 0.01, -0.03, 0.02, 0.005, -0.015), ct=0.995, sat=0.96, g=1.005, cv=None),               # матовый винтаж
+        dict(cb=(-0.02, 0.00, 0.02, 0.00, 0.00, 0.00), ct=1.05, sat=0.93, g=0.985, cv=None),                   # приглушённый контраст
     ]
     L = random.choice(looks)
     rs, gs, bs, rm, gmm, bm = (v * m for v in L["cb"])
     ct = 1.0 + (L["ct"] - 1.0) * m
     sat = 1.0 + (L["sat"] - 1.0) * m
     g = 1.0 + (L["g"] - 1.0) * m
-    parts = [f"curves=preset={L['cv']}",
-             f"colorbalance=rs={rs:.3f}:gs={gs:.3f}:bs={bs:.3f}"
-             f":rm={rm:.3f}:gm={gmm:.3f}:bm={bm:.3f}",
-             f"eq=contrast={ct:.3f}:saturation={sat:.3f}:gamma={g:.3f}"]
+    parts = []
+    if L.get("cv"):
+        parts.append(f"curves=preset={L['cv']}")
+    parts += [f"colorbalance=rs={rs:.3f}:gs={gs:.3f}:bs={bs:.3f}"
+              f":rm={rm:.3f}:gm={gmm:.3f}:bm={bm:.3f}",
+              f"eq=contrast={ct:.3f}:saturation={sat:.3f}:gamma={g:.3f}"]
     return ",".join(parts)
 
 
@@ -1257,10 +1259,10 @@ def build_uniq_graph(w: int, h: int, ten_bit: bool = False,
     Сила:
       light  — незаметный уник (как раньше): микро-цветокор, кроп,
                поворот < 1°, зерно, аудио 1:1
-      medium — Заметный поворот 1.4-2.4° (видео на размытом фоне, как
-               шаблоны CapCut) + видимый цветовой фильтр-лук + виньетка
-               + зерно + сдвиг хромы + микро-скорость
-      strong — поворот 2.2-3.4° и лук пожёстче
+      medium — заметный поворот 1.4-2.4° (видео на размытом фоне, как
+               шаблоны CapCut) + мягкий цветовой фильтр-лук + зерно +
+               лёгкая виньетка + сдвиг хромы + микро-скорость
+      strong — поворот 2.2-3.4°, лук в полную силу (но без перегиба)
 
     simple=True — запасной вариант без поворота/фона/луков.
     """
@@ -1273,19 +1275,19 @@ def build_uniq_graph(w: int, h: int, ten_bit: bool = False,
         grain_r = (1, 2); vig_r = None; chroma_max = 0; speed_dev = 0.0
         tint_mag = (0.015, 0.030)
     elif st == "strong":
-        rot_r = (2.20, 3.40); crop_r = (0.020, 0.035); look = 1.2
-        grain_r = (5, 7); vig_r = (math.pi / 24.0, math.pi / 16.0)
+        rot_r = (2.20, 3.40); crop_r = (0.020, 0.035); look = 1.0
+        grain_r = (3, 4); vig_r = (math.pi / 45.0, math.pi / 30.0)
         chroma_max = 2; speed_dev = 0.0025
-    else:  # medium — «нормальный» уник
-        rot_r = (1.40, 2.40); crop_r = (0.015, 0.030); look = 1.0
-        grain_r = (3, 5); vig_r = (math.pi / 30.0, math.pi / 20.0)
+    else:  # medium — «нормальный» уник (лук мягкий)
+        rot_r = (1.40, 2.40); crop_r = (0.015, 0.030); look = 0.75
+        grain_r = (2, 3); vig_r = (math.pi / 60.0, math.pi / 45.0)
         chroma_max = 2; speed_dev = 0.0012
 
     # --- цветовой фильтр на всё видео ---
     if look is not None:
         color = _uniq_look_chain(look)
         # лёгкое затемнение поверх лука
-        color += f",eq=brightness=-{random.uniform(0.008, 0.025):.4f}"
+        color += f",eq=brightness=-{random.uniform(0.004, 0.014) * look:.4f}"
     else:
         br = -random.uniform(0.008, 0.020)
         gm = random.uniform(0.968, 0.995)
