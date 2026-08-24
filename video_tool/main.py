@@ -66,7 +66,7 @@ import imageio_ffmpeg
 import requests
 
 APP_NAME = "Video Stitcher Pro"
-APP_VERSION = "v2.6"
+APP_VERSION = "v2.9"
 
 # ------------------------------------------------------------ PATHS --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -89,8 +89,20 @@ VIDEO_EXTS = {
 
 # Bright color map used by [blue]...[ /blue] tags and quick buttons
 COLOR_MAP: Dict[str, str] = {
-    "blue":   "#00D5FF",
-    "cyan":   "#00E5FF",
+    # ---- синие (насыщенные, много оттенков) ----
+    "blue":       "#0066FF",   # основной — сочный электрик, не бледный
+    "electric":   "#0047FF",   # электрик глубже
+    "royal":      "#2952FF",   # королевский
+    "neonblue":   "#1F51FF",   # неоновый
+    "deepblue":   "#0026FF",   # ультра-глубокий
+    "ultramarine": "#3B24FF",  # ультрамарин
+    "indigo":     "#4B0DFF",   # индиго
+    "navy":       "#0A2FA8",   # тёмно-синий
+    "azure":      "#007FFF",   # лазурный
+    "sky":        "#2EB8FF",   # небесный
+    "babyblue":   "#7FDBFF",   # светло-голубой
+    "cyan":       "#00E5FF",   # бирюзово-голубой (старый "blue" был похож на него)
+    # ---- остальные ----
     "red":    "#FF4D6D",
     "yellow": "#FFD54F",
     "green":  "#4DFF8C",
@@ -598,6 +610,35 @@ def _probe(path: str, ffmpeg_exe: str) -> Dict[str, Any]:
         pm = re.search(r"Video:.*?(yuv\d+p\d+le|p010le|p210le|p016le|yuv444p12le)", txt)
         info["pix_fmt"] = pm.group(1) if pm else ""
         info["ten_bit"] = bool(pm)
+        # ---- color info: range + primaries/transfer/matrix ----
+        # examples:  yuv420p(tv, bt709, progressive)
+        #            yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)
+        #            yuvj420p(pc, progressive)
+        info["color_range"] = ""
+        info["color_trc"] = ""
+        info["color_primaries"] = ""
+        # match the parens right after the pixel format token:
+        #   ", yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67, ...)"
+        cm = re.search(r"Video:[^\n]*?,\s*[a-z0-9]+le?\(([^)]*)\)", txt)
+        if not cm:
+            cm = re.search(r"Video:[^\n]*?,\s*yuvj?\d+p[\da-z]*\(([^)]*)\)", txt)
+        if cm:
+            inner = cm.group(1)
+            parts = [p.strip() for p in inner.split(",")]
+            for p in parts:
+                if p in ("tv", "pc"):
+                    info["color_range"] = p
+                elif "/" in p:                       # matrix/primaries/transfer
+                    bits = p.split("/")
+                    if len(bits) >= 3:
+                        info["color_primaries"] = bits[1].strip()
+                        info["color_trc"] = bits[2].strip()
+                elif p.startswith("bt") or "smpte" in p or "arib" in p:
+                    info["color_primaries"] = p
+        info["hdr"] = (
+            info["color_trc"] in ("smpte2084", "arib-std-b67")
+            or "bt2020" in info["color_primaries"]
+        )
     except Exception:
         pass
     return info
@@ -1059,26 +1100,542 @@ def build_atempo(factor: float) -> str:
 
 
 def _make_bg_chain(canvas_w: int, canvas_h: int, fps: int,
-                   blur_fill: bool = False) -> str:
+                   blur_fill: bool = False, prefix: str = "") -> str:
     """Background filter chain ending with the [bg] output label.
 
     Normal: scale+center-crop. blur_fill: full-frame blurred copy behind the
     centered original (no content lost for non-vertical sources).
+    prefix: optional color-normalization filters inserted before scaling
+    (HDR tonemap / full-range fix for MOV sources).
     """
     if not blur_fill:
         return (
+            f"{prefix}"
             f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-            f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
+            f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,fps={fps}[bg]"
         )
     return (
+        f"{prefix}"
         f"split[bgA][fgA];"
         f"[bgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase:"
-        f"flags=lanczos,crop={canvas_w}:{canvas_h}:exact=1,"
+        f"flags=bicubic,crop={canvas_w}:{canvas_h}:exact=1,"
         f"boxblur=20:5,eq=brightness=-0.12,fps={fps}[blur];"
         f"[fgA]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease:"
-        f"flags=lanczos[fgvid];"
+        f"flags=bicubic[fgvid];"
         f"[blur][fgvid]overlay=(W-w)/2:(H-h)/2[bg]"
     )
+
+
+def _micro_uniq_chain(canvas_w: int, canvas_h: int) -> str:
+    """Invisible-to-the-eye uniquification filters (fresh random each call).
+
+    Changes the pixel data (hence hash/fingerprint) without visible impact:
+      • sub-pixel shift: upscale + crop with a random 1-6 px offset
+      • micro eq: brightness ±0.004, contrast/saturation ±0.008
+      • micro hue rotation ±0.4°
+      • faint film grain (strength 1) with a random seed
+    """
+    pad = 6                                  # work area for the shift crop
+    dx = random.randint(0, 4)
+    dy = random.randint(0, 4)
+    br = random.uniform(-0.004, 0.004)
+    ct = random.uniform(0.992, 1.008)
+    sat = random.uniform(0.992, 1.008)
+    hue = random.uniform(-0.4, 0.4)
+    seed = random.randint(0, 2 ** 31 - 1)
+    return (
+        f"scale={canvas_w + pad}:{canvas_h + pad}:flags=bicubic,"
+        f"crop={canvas_w}:{canvas_h}:{dx}:{dy},"
+        f"eq=brightness={br:.5f}:contrast={ct:.5f}:saturation={sat:.5f},"
+        f"hue=h={hue:.3f},"
+        f"noise=alls=1:allf=t:all_seed={seed},"
+    )
+
+
+# ======================================================================
+#  FINAL UNIQ — уникализация собранного ролика (v2.9, «как у CapCut»)
+# ======================================================================
+# Один пост-проход по уже собранному файлу (работает и в одиночной сборке,
+# и в батче, и во всех режимах бота). 3 уровня силы: light / medium / strong
+#   • поворот видео: заметный (1.4-2.4° на средней) на размытом фоне —
+#     как шаблоны CapCut, чёрных полос нет вообще
+#   • цветовой фильтр-лук на всё видео: случайный из 6 (тёплый плёночный /
+#     холодный кино / teal&orange / яркий / матовый винтаж / мрачный
+#     контраст) — curves + colorbalance + eq, картинка явно меняется,
+#     но остаётся нормальной
+#   • небольшой кроп по краям (1.2-3.5%) с масштабом обратно в полный кадр
+#   • лёгкое затемнение + зерно (меняется каждый кадр, случайный seed)
+#   • сдвиг хрома-каналов (chromashift), микро-виньетка
+#   • микро-смена скорости видео+аудио одним коэффициентом (рвёт и
+#     аудио-отпечатки) + микро-громкость
+#   • рандомная структура GOP/B-кадров — разный «скелет» файла
+#   • метаданные «как у CapCut» 1в1: creation_time = момент генерации,
+#     handler_name VideoHandle/SoundHandle (или из capcut_sample.mp4),
+#     бренд isom, encoder-подписей нет
+#   • умное сжатие в 2-3 раза без видимой потери качества (подбор CRF по
+#     пробному куску; если 2-3× недостижимо — жмёт насколько можно)
+
+UNIQ_TARGET_RATIO = 0.40          # цель: ~1/2.5 от исходного размера
+UNIQ_CRF_LADDER = (20, 23, 26)    # от «визуально без потерь» к максимуму
+UNIQ_STRENGTH_KEYS = ("light", "medium", "strong")
+UNIQ_STRENGTH_LABELS = ("Лёгкая", "Средняя", "Сильная")
+
+_filter_support_cache: Dict[str, bool] = {}
+
+
+def _ffmpeg_filter_supported(ffmpeg_exe: str, name: str) -> bool:
+    """Есть ли в этой сборке ffmpeg фильтр *name* (кэшируется)."""
+    key = ffmpeg_exe + "|" + name
+    if key in _filter_support_cache:
+        return _filter_support_cache[key]
+    ok = False
+    try:
+        r = subprocess.run([ffmpeg_exe, "-hide_banner", "filters"],
+                           capture_output=True, text=True, timeout=20)
+        ok = re.search(rf"\s{name}\s", (r.stdout or "") + (r.stderr or "")) is not None
+    except Exception:
+        ok = False
+    _filter_support_cache[key] = ok
+    return ok
+
+
+def _uniq_tint(mag_range: Tuple[float, float] = (0.015, 0.030)) -> str:
+    """Случайный лёгкий цветной оттенок (colorbalance) — для лёгкого режима."""
+    m = random.uniform(*mag_range)
+    presets = [
+        {"rs": m, "rm": m * 0.5, "bs": -m, "bm": -m * 0.5},        # тёплый
+        {"rs": -m, "rm": -m * 0.5, "bs": m, "bm": m * 0.5},        # холодный
+        {"rs": m, "bs": m, "gs": -m * 0.7},                        # пурпурный
+        {"gs": m * 0.8, "rs": -m * 0.6, "bs": -m * 0.6},           # зелёный
+        {"rs": m, "bs": -m, "gm": m * 0.35},                       # teal & orange
+    ]
+    p = random.choice(presets)
+    return "colorbalance=" + ":".join(f"{k}={v:.4f}" for k, v in p.items())
+
+
+def _uniq_look_chain(mag: float = 1.0) -> str:
+    """Видимый цветовой фильтр-лук на всё видео (случайный из набора).
+
+    Каждый лук — комбинация curves-пресета + colorbalance + eq: картинка
+    явно меняется (как фильтр из CapCut), но остаётся нормальной на вид.
+    mag — общая сила (0.85-1.3 со случайным джиттером).
+    """
+    m = random.uniform(0.8, 1.15) * mag
+    looks = [
+        # (colorbalance: rs gs bs rm gm bm, contrast, saturation, gamma, curves)
+        dict(cb=(0.04, 0.00, -0.04, 0.025, 0.00, -0.02), ct=1.02, sat=1.04, g=0.99, cv=None),                  # тёплый плёночный
+        dict(cb=(-0.035, 0.00, 0.04, -0.02, 0.00, 0.02), ct=1.025, sat=0.98, g=0.99, cv=None),                 # холодный кино
+        dict(cb=(-0.04, 0.015, 0.04, 0.045, 0.00, -0.03), ct=1.02, sat=1.04, g=0.99, cv=None),                 # teal & orange
+        dict(cb=(0.02, 0.00, 0.015, 0.015, 0.00, 0.01), ct=1.04, sat=1.07, g=1.015, cv="lighter"),             # яркий
+        dict(cb=(0.04, 0.01, -0.03, 0.02, 0.005, -0.015), ct=0.995, sat=0.96, g=1.005, cv=None),               # матовый винтаж
+        dict(cb=(-0.02, 0.00, 0.02, 0.00, 0.00, 0.00), ct=1.05, sat=0.93, g=0.985, cv=None),                   # приглушённый контраст
+    ]
+    L = random.choice(looks)
+    rs, gs, bs, rm, gmm, bm = (v * m for v in L["cb"])
+    ct = 1.0 + (L["ct"] - 1.0) * m
+    sat = 1.0 + (L["sat"] - 1.0) * m
+    g = 1.0 + (L["g"] - 1.0) * m
+    parts = []
+    if L.get("cv"):
+        parts.append(f"curves=preset={L['cv']}")
+    parts += [f"colorbalance=rs={rs:.3f}:gs={gs:.3f}:bs={bs:.3f}"
+              f":rm={rm:.3f}:gm={gmm:.3f}:bm={bm:.3f}",
+              f"eq=contrast={ct:.3f}:saturation={sat:.3f}:gamma={g:.3f}"]
+    return ",".join(parts)
+
+
+def build_uniq_graph(w: int, h: int, ten_bit: bool = False,
+                     simple: bool = False,
+                     strength: str = "medium",
+                     ffmpeg_exe: str = "") -> Tuple[str, str]:
+    """Фильтр-граф уникализации кадра W×H (каждый вызов — новый рандом).
+
+    Возвращает (filter_complex, audio_filter):
+      • filter_complex — вход [0:v], выход [v]
+      • audio_filter   — "" (аудио копируется 1:1) либо микро-цепочка
+        atempo+volume (микро-смена темпа: рвёт аудио-отпечатки, видео и
+        аудио остаются в синхроне — тот же коэффициент скорости)
+
+    Сила:
+      light  — незаметный уник (как раньше): микро-цветокор, кроп,
+               поворот < 1°, зерно, аудио 1:1
+      medium — заметный поворот 1.4-2.4° (видео на размытом фоне, как
+               шаблоны CapCut) + мягкий цветовой фильтр-лук + зерно +
+               лёгкая виньетка + сдвиг хромы + микро-скорость
+      strong — поворот 2.2-3.4°, лук в полную силу (но без перегиба)
+
+    simple=True — запасной вариант без поворота/фона/луков.
+    """
+    st = strength if strength in UNIQ_STRENGTH_KEYS else "medium"
+    pix = "yuv420p10le" if ten_bit else "yuv420p"
+    apix = "yuva420p10le" if ten_bit else "yuva420p"
+
+    if st == "light":
+        rot_r = (0.30, 0.80); crop_r = (0.012, 0.020); look = None
+        grain_r = (1, 2); vig_r = None; chroma_max = 0; speed_dev = 0.0
+        tint_mag = (0.015, 0.030)
+    elif st == "strong":
+        rot_r = (2.20, 3.40); crop_r = (0.020, 0.035); look = 1.0
+        grain_r = (3, 4); vig_r = (math.pi / 45.0, math.pi / 30.0)
+        chroma_max = 2; speed_dev = 0.0025
+    else:  # medium — «нормальный» уник (лук мягкий)
+        rot_r = (1.40, 2.40); crop_r = (0.015, 0.030); look = 0.75
+        grain_r = (2, 3); vig_r = (math.pi / 60.0, math.pi / 45.0)
+        chroma_max = 2; speed_dev = 0.0012
+
+    # --- цветовой фильтр на всё видео ---
+    if look is not None:
+        color = _uniq_look_chain(look)
+        # лёгкое затемнение поверх лука
+        color += f",eq=brightness=-{random.uniform(0.004, 0.014) * look:.4f}"
+    else:
+        br = -random.uniform(0.008, 0.020)
+        gm = random.uniform(0.968, 0.995)
+        ct = random.uniform(1.005, 1.025)
+        sat = random.uniform(0.970, 1.030)
+        color = (f"eq=brightness={br:.4f}:contrast={ct:.4f}:"
+                 f"saturation={sat:.4f}:gamma={gm:.4f},{_uniq_tint(tint_mag)}")
+    hue = random.uniform(1.5, 3.5) * random.choice((-1, 1))
+    seed = random.randint(0, 2 ** 31 - 1)
+    grain = f"noise=alls={random.randint(*grain_r)}:allf=t+u:all_seed={seed}"
+
+    # --- невидимые усилители ---
+    extras = ""
+    if chroma_max > 0 and ffmpeg_exe \
+            and _ffmpeg_filter_supported(ffmpeg_exe, "chromashift"):
+        ch = random.randint(1, chroma_max)
+        ch2 = random.randint(1, chroma_max)
+        extras += (f"chromashift=cbh={random.choice((-ch, ch))}:"
+                   f"cbv={random.choice((-ch2, ch2))}:"
+                   f"crh={random.choice((-ch2, ch2))}:"
+                   f"crv={random.choice((-ch, ch))},")
+    if vig_r is not None:
+        extras += f"vignette={random.uniform(*vig_r):.6f},"
+
+    # --- микро-смена скорости (medium/strong) ---
+    speed = random.uniform(1.0 - speed_dev, 1.0 + speed_dev) \
+        if speed_dev > 0 else 1.0
+    pts = f"setpts=PTS/{speed:.6f}," if speed != 1.0 else ""
+    audio_filter = ""
+    if speed != 1.0:
+        audio_filter = (f"atempo={speed:.6f},"
+                        f"volume={random.uniform(0.99, 1.01):.4f}")
+
+    # --- кроп по краям + масштаб обратно ---
+    cw = int(w * (1.0 - 2 * random.uniform(*crop_r))); cw -= cw % 2
+    ch_ = int(h * (1.0 - 2 * random.uniform(*crop_r))); ch_ -= ch_ % 2
+    cx = (w - cw) // 2
+    cy = (h - ch_) // 2
+
+    if simple:
+        vf = (f"[0:v]crop={cw}:{ch_}:{cx}:{cy}:exact=1,"
+              f"scale={w}:{h}:flags=bicubic,"
+              f"{color},hue=h={hue:.2f},{grain},{pts}format={pix}[v]")
+        return vf, audio_filter
+
+    # --- поворот: видео повёрнуто на размытом фоне (без чёрных полос) ---
+    rot = random.uniform(*rot_r) * random.choice((-1, 1))
+    rad = math.radians(rot)
+
+    # фон позади: увеличенная размытая копия — заполняет углы поворота
+    z = random.uniform(1.12, 1.20)
+    bw = int(w * z); bw += bw % 2
+    bh = int(h * z); bh += bh % 2
+
+    vf = (
+        f"[0:v]split=2[ubgS][ufgS];"
+        f"[ubgS]scale={bw}:{bh}:force_original_aspect_ratio=increase:"
+        f"flags=bicubic,crop={w}:{h}:exact=1,boxblur=24:3,"
+        f"eq=brightness=-0.06:saturation=1.08[ubg];"
+        f"[ufgS]crop={cw}:{ch_}:{cx}:{cy}:exact=1,format={apix},"
+        f"rotate={rad:.6f}:c=0x00000000,scale={w}:{h}:flags=bicubic[ufg];"
+        f"[ubg][ufg]overlay=0:0:shortest=1,"
+        f"{extras}{color},hue=h={hue:.2f},{grain},{pts}format={pix}[v]"
+    )
+    return vf, audio_filter
+
+
+def _audio_is_aac(path: str, ffmpeg_exe: str) -> bool:
+    try:
+        r = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", path],
+                           capture_output=True, text=True, timeout=30)
+        return bool(re.search(r"Audio:\s*aac\b", r.stderr or ""))
+    except Exception:
+        return False
+
+
+# ---------- метаданные «как у CapCut» ----------
+# Файл на выходе выглядит так, будто его только что экспортнул CapCut:
+#   • creation_time = момент генерации (свежий экспорт)
+#   • handler_name = VideoHandle / SoundHandle (стиль CapCut/Android)
+#   • бренд isom + minor 512 + compatible isomiso2avc1mp41
+#   • никаких encoder-подписей (Lavf/Lavc вычищаются)
+# Положи рядом свой реальный экспорт из CapCut под именем capcut_sample.mp4
+# (или .mov) — и значения handler'ов и бренд скопируются из него 1в1.
+
+CAPCUT_HANDLER_V = "VideoHandle"
+CAPCUT_HANDLER_A = "SoundHandle"
+CAPCUT_BRAND = "isom"
+
+_capcut_meta_cache: Optional[Dict[str, str]] = None
+_brand_opt_cache: Dict[str, bool] = {}
+
+
+def _brand_supported(ffmpeg_exe: str) -> bool:
+    """Поддерживает ли muxer mp4 опцию -brand (ffmpeg 6.1+)."""
+    if ffmpeg_exe in _brand_opt_cache:
+        return _brand_opt_cache[ffmpeg_exe]
+    ok = False
+    try:
+        r = subprocess.run([ffmpeg_exe, "-hide_banner", "-h", "muxer=mp4"],
+                           capture_output=True, text=True, timeout=20)
+        ok = "-brand" in ((r.stdout or "") + (r.stderr or ""))
+    except Exception:
+        ok = False
+    _brand_opt_cache[ffmpeg_exe] = ok
+    return ok
+
+
+def _capcut_sample_meta(ffmpeg_exe: str) -> Dict[str, str]:
+    """Метаданные под CapCut: из образца capcut_sample.* (1в1) или дефолт."""
+    global _capcut_meta_cache
+    if _capcut_meta_cache is not None:
+        return _capcut_meta_cache
+    meta = {"handler_v": CAPCUT_HANDLER_V, "handler_a": CAPCUT_HANDLER_A,
+            "brand": CAPCUT_BRAND, "source": "default"}
+    sample = ""
+    for name in ("capcut_sample.mp4", "capcut_sample.mov",
+                 "capcut_sample.MOV", "capcut_sample.MP4"):
+        p = os.path.join(BASE_DIR, name)
+        if os.path.isfile(p):
+            sample = p
+            break
+    if sample:
+        try:
+            r = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", sample],
+                               capture_output=True, text=True, timeout=30)
+            txt = r.stderr or ""
+            mb = re.search(r"major_brand\s*:\s*(\S+)", txt)
+            hv = ha = ""
+            cur = None
+            for line in txt.splitlines():
+                if "Stream #" in line:
+                    if "Video:" in line:
+                        cur = "v"
+                    elif "Audio:" in line:
+                        cur = "a"
+                hm = re.search(r"handler_name\s*:\s*(\S.*)", line)
+                if hm and hm.group(1).strip():
+                    if cur == "v" and not hv:
+                        hv = hm.group(1).strip()
+                    elif cur == "a" and not ha:
+                        ha = hm.group(1).strip()
+            if hv:
+                meta["handler_v"] = hv
+            if ha:
+                meta["handler_a"] = ha
+            if mb:
+                meta["brand"] = mb.group(1)
+            meta["source"] = os.path.basename(sample)
+        except Exception:
+            pass
+    _capcut_meta_cache = meta
+    return meta
+
+
+def _uniq_metadata_args(meta: Dict[str, str], has_audio: bool,
+                        ffmpeg_exe: str) -> List[str]:
+    """Аргументы ffmpeg: метаданные как у свежего экспорта CapCut."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000Z"
+    args = ["-metadata", f"creation_time={ts}",
+            "-metadata:s:v:0", f"handler_name={meta['handler_v']}"]
+    if has_audio:
+        args += ["-metadata:s:a:0", f"handler_name={meta['handler_a']}"]
+    if _brand_supported(ffmpeg_exe):
+        args += ["-brand", meta["brand"]]
+    return args
+
+
+def _polish_metadata(path: str, ffmpeg_exe: str, meta: Dict[str, str],
+                     has_audio: bool) -> bool:
+    """Финальный copy-ремукс: убирает encoder-подписи (Lavf/Lavc),
+    оставляя метаданные CapCut. Мгновенный (без перекодирования).
+    """
+    tmp = path + ".polish.mp4"
+    try:
+        cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", path, "-map", "0", "-c", "copy",
+               "-map_metadata", "-1", "-map_chapters", "-1", "-bitexact"]
+        cmd += _uniq_metadata_args(meta, has_audio, ffmpeg_exe)
+        cmd += ["-movflags", "+faststart", tmp]
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
+        if r.returncode == 0 and os.path.isfile(tmp) \
+                and os.path.getsize(tmp) > 1024:
+            os.replace(tmp, path)
+            return True
+    except Exception:
+        pass
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
+
+
+def _uniq_pick_crf(src: str, ffmpeg_exe: str, chain: str, duration: float,
+                   ten_bit: bool) -> int:
+    """Подбор CRF для сжатия ×2-3: короткая проба середины ролика.
+
+    Возвращает первый CRF из лестницы, дающий ~UNIQ_TARGET_RATIO от
+    исходного битрейта. Если 2-3× недостижимо — жмёт настолько, насколько
+    можно без заметной потери качества.
+    """
+    try:
+        size = os.path.getsize(src)
+        if size <= 0 or duration <= 0:
+            return 21
+        in_br = size * 8.0 / duration            # бит/с исходника
+        t = min(4.0, max(1.5, duration / 3.0))
+        ss = max(0.0, duration / 2.0 - t / 2.0)
+        pix = "yuv420p10le" if ten_bit else "yuv420p"
+        tmp = os.path.join(OUTPUT_DIR, f"_uniq_probe_{uuid.uuid4().hex[:8]}.mp4")
+        ratio_last: Optional[float] = None
+        for crf in UNIQ_CRF_LADDER:
+            try:
+                cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                       "-ss", f"{ss:.3f}", "-t", f"{t:.3f}", "-i", src,
+                       "-filter_complex", chain, "-map", "[v]", "-an",
+                       "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", str(crf), "-pix_fmt", pix, tmp]
+                r = subprocess.run(cmd, capture_output=True, timeout=180)
+                if r.returncode != 0 or not os.path.isfile(tmp):
+                    return 21
+                ratio = (os.path.getsize(tmp) * 8.0 / t) / in_br
+                if ratio <= UNIQ_TARGET_RATIO:
+                    return crf
+                if crf == UNIQ_CRF_LADDER[-1]:
+                    ratio_last = ratio
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        # цели 2-3× не достигли: если максимум лестницы даёт хоть что-то
+        # (~1.8×) — берём его, иначе щадящий CRF 23
+        if ratio_last is not None and ratio_last <= 0.55:
+            return UNIQ_CRF_LADDER[-1]
+        return 23
+    except Exception:
+        return 21
+
+
+def uniquify_file(src: str, dst: str, ffmpeg_exe: str,
+                  ten_bit: Optional[bool] = None,
+                  strength: str = "medium") -> Tuple[bool, str]:
+    """Уникализация + сжатие ×2-3: src → dst одним перекодом.
+
+    ten_bit=None — определить 10-битность исходника автоматически.
+    strength — light / medium / strong (диапазоны эффектов, см.
+    build_uniq_graph). Метаданные — как у свежего экспорта CapCut
+    (см. _capcut_sample_meta / capcut_sample.mp4).
+    """
+    if not os.path.isfile(src):
+        return False, f"нет файла: {src}"
+    try:
+        info = _probe(src, ffmpeg_exe)
+        w = int(info.get("w") or 0)
+        h = int(info.get("h") or 0)
+        if w < 16 or h < 16:
+            return False, "не смог определить размер видео"
+        w -= w % 2
+        h -= h % 2
+        use10 = bool(info.get("ten_bit")) if ten_bit is None else bool(ten_bit)
+        pix = "yuv420p10le" if use10 else "yuv420p"
+
+        chain, audio_filter = build_uniq_graph(
+            w, h, ten_bit=use10, strength=strength, ffmpeg_exe=ffmpeg_exe)
+        crf = _uniq_pick_crf(src, ffmpeg_exe, chain,
+                             float(info.get("duration") or 0.0), use10)
+        # метаданные «как у CapCut»: из образца capcut_sample.* или дефолт
+        capcut_meta = _capcut_sample_meta(ffmpeg_exe)
+        has_audio = bool(info.get("audio"))
+
+        # рандомная структура GOP/B-кадров — разный «скелет» файла у каждой
+        # сборки (на качество и размер не влияет)
+        gop = str(random.randint(90, 240))
+        bframes = str(random.randint(2, 4))
+
+        def encode(vf_chain: str, af: str, crf_v: int) -> Tuple[bool, str]:
+            cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                   "-i", src, "-filter_complex", vf_chain, "-map", "[v]",
+                   "-map", "0:a?",
+                   "-c:v", "libx264", "-preset", "medium",
+                   "-crf", str(crf_v), "-pix_fmt", pix,
+                   "-g", gop, "-bf", bframes]
+            if use10:
+                cmd += ["-profile:v", "high10",
+                        "-x264-params",
+                        "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
+            if info.get("audio"):
+                if af:
+                    # микро-смена темпа/громкости — рвёт аудио-отпечатки
+                    cmd += ["-af", af, "-c:a", "aac", "-b:a", "256k",
+                            "-ar", "44100", "-ac", "2"]
+                elif _audio_is_aac(src, ffmpeg_exe):
+                    cmd += ["-c:a", "copy"]          # аудио без потерь
+                else:
+                    cmd += ["-c:a", "aac", "-b:a", "256k",
+                            "-ar", "44100", "-ac", "2"]
+            # метаданные «как у CapCut» + вычищение всего лишнего
+            cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-bitexact"]
+            cmd += _uniq_metadata_args(capcut_meta, has_audio, ffmpeg_exe)
+            cmd += ["-movflags", "+faststart", dst]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=3600)
+            except subprocess.TimeoutExpired:
+                return False, "timeout"
+            if r.returncode == 0 and os.path.isfile(dst) \
+                    and os.path.getsize(dst) > 1024:
+                return True, ""
+            return False, (r.stderr or b"").decode("utf-8", "replace")[-800:]
+
+        ok, err = encode(chain, audio_filter, crf)
+        if not ok:
+            # запасной вариант: тот же цветокор/кроп/зерно, но без
+            # поворота, фона, хромы и виньетки (совместимость с любыми
+            # сборками ffmpeg)
+            chain2, audio_filter2 = build_uniq_graph(
+                w, h, ten_bit=use10, simple=True, strength=strength)
+            ok, err = encode(chain2, audio_filter2, crf)
+        if ok:
+            # финальная полировка метаданных (copy-ремукс, мгновенно):
+            # убирает encoder-подписи, метаданные CapCut остаются
+            _polish_metadata(dst, ffmpeg_exe, capcut_meta, has_audio)
+        return ok, err
+    except Exception as e:
+        return False, str(e)
+
+
+def uniquify_final_video(path: str, ffmpeg_exe: str,
+                         strength: str = "medium") -> Tuple[bool, str]:
+    """Уникализация файла на месте (tmp + атомарная замена)."""
+    tmp = path + ".uniq.mp4"
+    ok, err = uniquify_file(path, tmp, ffmpeg_exe, strength=strength)
+    if ok:
+        try:
+            os.replace(tmp, path)
+            return True, ""
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False, str(e)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False, err
 
 
 def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
@@ -1088,28 +1645,54 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
                          with_audio: bool = True,
                          canvas_w: int = 1080, canvas_h: int = 1920,
                          ten_bit: bool = False, blur_fill: bool = False,
-                         audio_kbps: int = 192,
+                         audio_kbps: int = 192, micro_uniq: bool = False,
                          progress_cb=None) -> Tuple[bool, str]:
     """One vertical segment via a single ffmpeg call.
 
     ten_bit  — keep 10-bit depth when the source is 10-bit (no banding).
     blur_fill— blurred background fill instead of hard crop for wrong aspect.
+    micro_uniq — invisible pixel-level uniquification (random sub-pixel
+    shift + micro color/grain) so every output has a different fingerprint.
     """
     try:
         target_dur = max(0.3, float(target_dur))
         orig_dur = max(0.05, float(orig_dur or target_dur))
         has_audio = with_audio and video_has_audio(input_video, ffmpeg_exe)
 
+        # probe source color info (HDR / full-range MOVs from iPhone etc.)
+        src_info: Dict[str, Any] = {}
+        try:
+            src_info = _probe(input_video, ffmpeg_exe)
+        except Exception:
+            src_info = {}
+
         # decide output pixel format (10-bit only when source is 10-bit)
         use10 = False
         if ten_bit:
-            try:
-                use10 = bool(_probe(input_video, ffmpeg_exe).get("ten_bit"))
-            except Exception:
-                use10 = False
+            use10 = bool(src_info.get("ten_bit"))
         pix = "yuv420p10le" if use10 else "yuv420p"
 
-        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill)
+        # ---- color normalization prefix for MOV/iPhone sources ----
+        # HDR (HLG/PQ/bt2020): proper tonemap to SDR bt709 — otherwise the
+        # colors get oversaturated / oversharpened-looking after a naive
+        # matrix reinterpretation.
+        # Full-range (pc/yuvj420p): explicit pc->tv conversion — otherwise
+        # contrast gets crushed/boosted ("повышенная резкость" look).
+        color_fix = ""
+        if src_info.get("hdr"):
+            color_fix = (
+                "zscale=t=linear:npl=100,format=gbrpf32le,"
+                "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+            )
+        elif src_info.get("color_range") == "pc":
+            color_fix = (
+                "scale=in_range=pc:out_range=tv,"
+                "setparams=range=tv:colorspace=bt709,"
+            )
+
+        bg_chain = _make_bg_chain(canvas_w, canvas_h, fps, blur_fill,
+                                  prefix=color_fix)
 
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         vf: List[str] = []
@@ -1121,13 +1704,18 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         # otherwise the container gets padded to the longer audio
         silent_dur = target_dur if is_first else min(orig_dur, target_dur)
 
+        # normalize audio for safe concat -c copy: constant 44.1k, async
+        # resample kills MOV/iPhone priming-sample drift, apad guarantees
+        # the track is at least as long as the video (then -t cuts exact)
+        A_NORM = "aresample=44100:async=1:first_pts=0,apad"
+
         if is_first and orig_dur > target_dur:
             # ---------- SPEED UP (first segment too long) ----------
             speed_factor = orig_dur / target_dur
             cmd += ["-i", input_video]
             vf.append(f"[0:v]setpts=PTS/{speed_factor:.6f},{bg_chain}")
             if has_audio:
-                vf.append(f"[0:a]{build_atempo(speed_factor)}[a]")
+                vf.append(f"[0:a]{build_atempo(speed_factor)},{A_NORM}[a]")
                 audio_idx = 0
         elif is_first and orig_dur < target_dur:
             # ---------- LOOP (first segment too short) ----------
@@ -1135,7 +1723,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-stream_loop", str(loop), "-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
             trim_out = target_dur
         else:
@@ -1147,7 +1735,7 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
             cmd += ["-i", input_video]
             vf.append(f"[0:v]{bg_chain}")
             if has_audio:
-                vf.append("[0:a]anull[a]")
+                vf.append(f"[0:a]{A_NORM}[a]")
                 audio_idx = 0
 
         # silent track when audio requested but source has none
@@ -1165,7 +1753,8 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         fmt = f"format={pix}" + (":" + cs_opt if cs_opt else "")
         # text PNG is FULL canvas with the text already drawn at its absolute
         # position -> overlay at 0:0 (any other offset would shift it off-screen)
-        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{fmt}[v]")
+        uniq = _micro_uniq_chain(canvas_w, canvas_h) if micro_uniq else ""
+        vf.append(f"[bg][fg]overlay=0:0:shortest=1,{uniq}{fmt}[v]")
 
         cmd += ["-filter_complex", ";".join(vf)]
         cmd += ["-map", "[v]"]
@@ -1180,8 +1769,13 @@ def build_segment_ffmpeg(input_video: str, text_png: str, x: int, y: int,
         if audio_idx >= 0:
             cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k",
                     "-ar", "44100", "-ac", "2"]
-        if trim_out:
-            cmd += ["-t", f"{trim_out:.3f}"]
+        # -t is mandatory: apad makes the audio endless, and MOV sources
+        # often report audio slightly longer than video — cut both exactly
+        out_t = trim_out if trim_out else (target_dur if is_first
+                                           else min(orig_dur, target_dur))
+        cmd += ["-t", f"{out_t:.3f}"]
+        # identical timebase in every segment -> concat -c copy never breaks
+        cmd += ["-video_track_timescale", "90000"]
         cmd += ["-movflags", "+faststart", seg_out]
 
         if progress_cb:
@@ -1209,9 +1803,22 @@ def concat_videos(seg_files: List[str], out_path: str, ffmpeg_exe: str,
         with open(tmp_list, "w", encoding="utf-8") as f:
             for s in seg_files:
                 f.write("file '" + s.replace("\\", "/").replace("'", "'\\''") + "'\n")
+        # video: lossless stream copy. audio: cheap re-encode — AAC frames
+        # are 1024 samples, so each segment's audio is a hair longer than
+        # its video; pure -c copy then yields non-monotonic DTS (broken
+        # timestamps, players stutter — especially with MOV sources).
+        # aresample=async=1 re-times audio into one continuous track.
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+               "-fflags", "+genpts",
                "-f", "concat", "-safe", "0", "-i", tmp_list,
-               "-c", "copy", out_path]
+               "-c:v", "copy"]
+        if with_audio:
+            cmd += ["-af", "aresample=44100:async=1:first_pts=0",
+                    "-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2",
+                    "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-movflags", "+faststart", out_path]
         r = subprocess.run(cmd, capture_output=True, timeout=600)
         if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
             return True, ""
@@ -1269,11 +1876,15 @@ def build_one_final_ffmpeg(video_paths: List[str],
                            audio_kbps: int = 192,
                            random_flags: Optional[List[bool]] = None,
                            preset_indices: Optional[List[int]] = None,
+                           micro_uniq: bool = False,
                            progress_cb=None) -> Tuple[bool, str]:
     """Full pipeline: render 5 segments in parallel, concat, cleanup.
 
     random_flags[i]=False -> use segment i's CURRENT preset (the one shown
     in the preview) instead of a random one.
+    micro_uniq=True -> segments 2-5 (folder_2..folder_5 material) get an
+    invisible random pixel-level uniquification, so every build has a
+    different hash/fingerprint even from the same source files.
     """
     canvas_w, canvas_h = resolution
     temp = os.path.join(OUTPUT_DIR, f"_temp_{uuid.uuid4().hex[:8]}")
@@ -1312,6 +1923,7 @@ def build_one_final_ffmpeg(video_paths: List[str],
                 seg_out=seg_out, ffmpeg_exe=ffmpeg_exe, crf=crf, preset=preset,
                 fps=fps, with_audio=with_audio, canvas_w=canvas_w, canvas_h=canvas_h,
                 ten_bit=ten_bit, blur_fill=blur_fill, audio_kbps=audio_kbps,
+                micro_uniq=(micro_uniq and i >= 1),
             )
             if not ok:
                 errors.append(f"seg{i}: {err}")
@@ -2811,6 +3423,23 @@ class SegmentCard(QFrame):
             crow.addWidget(b)
         crow.addStretch(1)
         edl.addLayout(crow)
+
+        # ---- вторая строка: оттенки синего ----
+        blues = ["electric", "royal", "neonblue", "deepblue",
+                 "ultramarine", "indigo", "navy", "azure", "sky", "babyblue"]
+        brow = QHBoxLayout()
+        brow.setSpacing(5)
+        brow.addWidget(QLabel("Синие:"))
+        for name in blues:
+            b = QPushButton()
+            b.setObjectName("ColorBtn")
+            b.setStyleSheet(f"QPushButton#ColorBtn {{ background: {COLOR_MAP[name]}; }}")
+            b.setToolTip(f"[{name}]…[/{name}]  {COLOR_MAP[name]}")
+            b.clicked.connect(lambda _, n=name: self._insert_color(n))
+            self._color_btns.append(b)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        edl.addLayout(brow)
         root.addWidget(ed_frame)
 
         # ================= POSITION / SIZE =================
@@ -3333,11 +3962,38 @@ class ExportCard(SidebarCard):
                                  "размытой копией вместо жёсткого кропа — контент не теряется.")
         self.chk_econ = QCheckBox("Эконом (без превью)")
         self.chk_econ.setToolTip("Не грузить видео в превью — экономия RAM при 1000+ видео")
+        self.chk_final_uniq = QCheckBox("🧬 Уник финала + сжатие ×2-3")
+        self.chk_final_uniq.setChecked(True)
+        self.chk_final_uniq.setToolTip(
+            "Пост-обработка собранного видео (работает и в одиночной сборке, и в батче):\n"
+            "• заметный поворот на размытом фоне (как шаблоны CapCut, без чёрных полос)\n"
+            "• цветовой фильтр-лук на всё видео (curves + цветобаланс + зерно + виньетка)\n"
+            "• небольшой кроп по краям + лёгкое затемнение\n"
+            "• сдвиг хромы, микро-смена скорости (рвёт и аудио-отпечатки)\n"
+            "• сжатие в 2-3 раза без видимой потери качества (умный подбор CRF)\n"
+            "• метаданные — как у свежего экспорта CapCut (клади свой\n"
+            "  capcut_sample.mp4 рядом с main.py — скопируется 1в1)")
         s2._inner.addWidget(self.chk_audio)
         s2._inner.addWidget(self.chk_caps)
         s2._inner.addWidget(self.chk_tenbit)
         s2._inner.addWidget(self.chk_blur)
         s2._inner.addWidget(self.chk_econ)
+        s2._inner.addWidget(self.chk_final_uniq)
+
+        uniq_row = QHBoxLayout()
+        lbl = QLabel("Сила уника:")
+        uniq_row.addWidget(lbl)
+        self.uniq_strength_combo = QComboBox()
+        self.uniq_strength_combo.addItems(list(UNIQ_STRENGTH_LABELS))
+        self.uniq_strength_combo.setCurrentIndex(1)      # средняя
+        self.uniq_strength_combo.setToolTip(
+            "Лёгкая — незаметный уник: микро-цветокор, поворот <1°,\n"
+            "аудио копируется 1:1.\n"
+            "Средняя — заметный поворот 1.4-2.4° на размытом фоне +\n"
+            "видимый цветовой фильтр-лук + зерно/виньетка/хрома/скорость.\n"
+            "Сильная — поворот 2.2-3.4° и лук пожёстче.")
+        uniq_row.addWidget(self.uniq_strength_combo, 1)
+        s2._inner.addLayout(uniq_row)
 
         s3 = self._add_section("Куда")
         orow = QHBoxLayout()
@@ -3353,8 +4009,9 @@ class ExportCard(SidebarCard):
         s3._inner.addLayout(orow)
 
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.currentIndexChanged.connect(self._changed) if isinstance(w, QComboBox) \
                 else w.toggled.connect(self._changed)
 
@@ -3375,6 +4032,10 @@ class ExportCard(SidebarCard):
             "ten_bit": self.chk_tenbit.isChecked(),
             "blur_fill": self.chk_blur.isChecked(),
             "econ": self.chk_econ.isChecked(),
+            "final_uniq": self.chk_final_uniq.isChecked(),
+            "uniq_strength": UNIQ_STRENGTH_KEYS[
+                min(max(self.uniq_strength_combo.currentIndex(), 0),
+                    len(UNIQ_STRENGTH_KEYS) - 1)],
             "crf": q["crf"],
             "preset": q["preset"],
             "quality_text": q["label"],
@@ -3384,8 +4045,9 @@ class ExportCard(SidebarCard):
         if not isinstance(cfg, dict):
             cfg = {}
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.blockSignals(True)
         if "resolution_index" in cfg:
             self.res_combo.setCurrentIndex(
@@ -3410,9 +4072,17 @@ class ExportCard(SidebarCard):
         if "ten_bit" in cfg: self.chk_tenbit.setChecked(bool(cfg["ten_bit"]))
         if "blur_fill" in cfg: self.chk_blur.setChecked(bool(cfg["blur_fill"]))
         if "econ" in cfg: self.chk_econ.setChecked(bool(cfg["econ"]))
+        if "final_uniq" in cfg: self.chk_final_uniq.setChecked(bool(cfg["final_uniq"]))
+        if "uniq_strength" in cfg:
+            try:
+                i = list(UNIQ_STRENGTH_KEYS).index(str(cfg["uniq_strength"]))
+                self.uniq_strength_combo.setCurrentIndex(i)
+            except ValueError:
+                pass
         for w in (self.res_combo, self.fps_combo, self.quality_combo,
+                  self.uniq_strength_combo,
                   self.chk_audio, self.chk_caps, self.chk_tenbit, self.chk_blur,
-                  self.chk_econ):
+                  self.chk_econ, self.chk_final_uniq):
             w.blockSignals(False)
 
 # ======================================================================
@@ -3851,7 +4521,10 @@ class BatchCard(SidebarCard):
         s._inner.addWidget(self.next_preview)
 
         hint = QLabel("Каждый персонаж из folder_1 + folder_2…5 → одно готовое Reels-видео. "
-                      "0 = Auto: min длин для «Последовательно», len(folder_1) для «Рандом».")
+                      "«Сколько» = точное число: если исходников меньше — они ходят по кругу, "
+                      "уник (🧬 Экспорт) делает каждый файл уникальным. "
+                      "0 = Auto: min длин для «Последовательно», len(folder_1) для «Рандом». "
+                      "С «Удалять 2–5» / «В used» максимум ограничен числом исходников.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         self.layout().addWidget(hint)
@@ -3904,6 +4577,7 @@ class BatchCard(SidebarCard):
         others = [list_videos(d) for d in FOLDER_DIRS[1:]]
         others_len = [len(v) for v in others]
         mode = self.mode_combo.currentIndex()
+        consume = self.chk_delete.isChecked() or self.chk_move.isChecked()
         info = {"chars": [], "total": 0, "mode": mode, "others": others_len}
         total = 0
         for path, name, n in char_folders:
@@ -3913,8 +4587,17 @@ class BatchCard(SidebarCard):
                 m = n
             info["chars"].append((name, n, m))
             total += m
+        info["base_total"] = total          # сколько задач без переиспользования
         cnt = self.count_spin.value()
-        info["total"] = min(total, cnt) if cnt > 0 else total
+        if cnt > 0:
+            if total < cnt and not consume and total > 0:
+                # задано больше, чем исходников: уник делает каждый файл
+                # уникальным, исходники переиспользуются — сделаем ровно
+                # столько, сколько задал юзер
+                total = cnt
+            else:
+                total = min(total, cnt)
+        info["total"] = total
         return info
 
     def update_info(self):
@@ -3922,8 +4605,14 @@ class BatchCard(SidebarCard):
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
+        note = ""
+        cnt = self.count_spin.value()
+        if cnt > 0 and info["total"] >= cnt > info.get("base_total", 0):
+            note = (" • исходников меньше, но uniq делает каждый файл "
+                    "уникальным — исходники пойдут по кругу")
         self.count_info.setText(
-            f"В папках: {', '.join(parts)} → будет {info['total']} видео [{mode_txt}]")
+            f"В папках: {', '.join(parts)} → будет {info['total']} видео "
+            f"[{mode_txt}]{note}")
         # next batch preview
         if self.main:
             nxt = self.main.peek_next_batch(info["chars"])
@@ -4156,6 +4845,14 @@ class BuildWorker(QThread):
                 if not ok2:
                     self.failed.emit(f"Ошибка: {err}\nMoviePy: {err2}")
                     return
+            # ---- 🧬 уник финала: цветокор + кроп + поворот + фон + сжатие
+            if exp.get("final_uniq", False):
+                self.progress.emit(90, "🧬 Уник финала: цветокор + поворот + сжатие…")
+                uok, uerr = uniquify_final_video(
+                    out_path, ff, strength=exp.get("uniq_strength", "medium"))
+                if not uok:
+                    # уник не должен ронять сборку — оставляем оригинал
+                    print(f"[uniq] {out_path}: {uerr}")
             self.progress.emit(97, "Готово")
             self.file_done.emit(out_path)
             self.finished_ok.emit(out_path)
@@ -4217,17 +4914,36 @@ class BatchBuildWorker(QThread):
             # ---------- build task list ----------
             tasks: List[Tuple[str, str, int]] = []   # (char_folder, char_name, vid_idx)
             mode = bcfg["mode"]
+            consume = bool(bcfg["delete"] or bcfg["move"])
+            # (path, name, всего видео у персонажа, базовый лимит)
+            char_info: List[Tuple[str, str, int, int]] = []
             for path, name, n in char_folders:
                 cv = list_videos(path)
+                if not cv:
+                    continue
                 if mode == 0:
                     m = min(len(cv), *[len(v) for v in others])
                 else:
                     m = len(cv)
+                char_info.append((path, name, len(cv), m))
                 for i in range(m):
                     tasks.append((path, name, i))
             cnt = bcfg["count"]
             if cnt > 0:
-                tasks = tasks[:cnt]
+                if len(tasks) < cnt and not consume and char_info:
+                    # юзер задал больше, чем есть исходников — делаем столько,
+                    # сколько задано: исходники ходят по кругу, а уник всё
+                    # равно делает каждый файл уникальным (рандом на каждый
+                    # прогон: цветокор/кроп/поворот/фон/зерно/GOP)
+                    next_idx = {p: m for p, _nm, _n, m in char_info}
+                    ci = 0
+                    while len(tasks) < cnt:
+                        path, name, n, _m = char_info[ci % len(char_info)]
+                        tasks.append((path, name, next_idx[path] % n))
+                        next_idx[path] += 1
+                        ci += 1
+                else:
+                    tasks = tasks[:cnt]
             total = len(tasks)
             if total == 0:
                 self.failed.emit("Нечего собирать — 0 задач.")
@@ -4285,9 +5001,11 @@ class BatchBuildWorker(QThread):
             def build_task(task: Tuple[str, str, int]) -> Optional[str]:
                 char_folder, char_name, vid_idx = task
                 cv = list_videos(char_folder)
-                if vid_idx >= len(cv):
+                if not cv:
                     return None
-                f1 = cv[vid_idx]
+                # при дозаполнении по кругу vid_idx может быть больше
+                # количества видео — берём по модулю
+                f1 = cv[vid_idx % len(cv)]
                 vp = pick_videos(f1, char_name, vid_idx)
                 if not vp:
                     return None
@@ -4311,6 +5029,12 @@ class BatchBuildWorker(QThread):
                 if not ok:
                     print(f"[batch] {out_name} failed: {err}")
                     return None
+                # ---- 🧬 уник финала (тот же, что в одиночной сборке)
+                if exp.get("final_uniq", False):
+                    uok, uerr = uniquify_final_video(
+                        out_path, ff, strength=exp.get("uniq_strength", "medium"))
+                    if not uok:
+                        print(f"[batch][uniq] {out_name}: {uerr}")
                 handle_used(vp)
                 # Telegram auto-send is handled on the GUI thread via
                 # file_done -> MainWindow.auto_send_file (auto-migrates chat id)
