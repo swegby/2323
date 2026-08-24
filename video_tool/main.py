@@ -4376,7 +4376,10 @@ class BatchCard(SidebarCard):
         s._inner.addWidget(self.next_preview)
 
         hint = QLabel("Каждый персонаж из folder_1 + folder_2…5 → одно готовое Reels-видео. "
-                      "0 = Auto: min длин для «Последовательно», len(folder_1) для «Рандом».")
+                      "«Сколько» = точное число: если исходников меньше — они ходят по кругу, "
+                      "уник (🧬 Экспорт) делает каждый файл уникальным. "
+                      "0 = Auto: min длин для «Последовательно», len(folder_1) для «Рандом». "
+                      "С «Удалять 2–5» / «В used» максимум ограничен числом исходников.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         self.layout().addWidget(hint)
@@ -4429,6 +4432,7 @@ class BatchCard(SidebarCard):
         others = [list_videos(d) for d in FOLDER_DIRS[1:]]
         others_len = [len(v) for v in others]
         mode = self.mode_combo.currentIndex()
+        consume = self.chk_delete.isChecked() or self.chk_move.isChecked()
         info = {"chars": [], "total": 0, "mode": mode, "others": others_len}
         total = 0
         for path, name, n in char_folders:
@@ -4438,8 +4442,17 @@ class BatchCard(SidebarCard):
                 m = n
             info["chars"].append((name, n, m))
             total += m
+        info["base_total"] = total          # сколько задач без переиспользования
         cnt = self.count_spin.value()
-        info["total"] = min(total, cnt) if cnt > 0 else total
+        if cnt > 0:
+            if total < cnt and not consume and total > 0:
+                # задано больше, чем исходников: уник делает каждый файл
+                # уникальным, исходники переиспользуются — сделаем ровно
+                # столько, сколько задал юзер
+                total = cnt
+            else:
+                total = min(total, cnt)
+        info["total"] = total
         return info
 
     def update_info(self):
@@ -4447,8 +4460,14 @@ class BatchCard(SidebarCard):
         parts = [f"1: {c[1]}" for c in info["chars"]]
         parts += [f"{i + 2}: {info['others'][i]}" for i in range(4)]
         mode_txt = "Последовательно" if info["mode"] == 0 else "Рандом"
+        note = ""
+        cnt = self.count_spin.value()
+        if cnt > 0 and info["total"] >= cnt > info.get("base_total", 0):
+            note = (" • исходников меньше, но uniq делает каждый файл "
+                    "уникальным — исходники пойдут по кругу")
         self.count_info.setText(
-            f"В папках: {', '.join(parts)} → будет {info['total']} видео [{mode_txt}]")
+            f"В папках: {', '.join(parts)} → будет {info['total']} видео "
+            f"[{mode_txt}]{note}")
         # next batch preview
         if self.main:
             nxt = self.main.peek_next_batch(info["chars"])
@@ -4750,17 +4769,36 @@ class BatchBuildWorker(QThread):
             # ---------- build task list ----------
             tasks: List[Tuple[str, str, int]] = []   # (char_folder, char_name, vid_idx)
             mode = bcfg["mode"]
+            consume = bool(bcfg["delete"] or bcfg["move"])
+            # (path, name, всего видео у персонажа, базовый лимит)
+            char_info: List[Tuple[str, str, int, int]] = []
             for path, name, n in char_folders:
                 cv = list_videos(path)
+                if not cv:
+                    continue
                 if mode == 0:
                     m = min(len(cv), *[len(v) for v in others])
                 else:
                     m = len(cv)
+                char_info.append((path, name, len(cv), m))
                 for i in range(m):
                     tasks.append((path, name, i))
             cnt = bcfg["count"]
             if cnt > 0:
-                tasks = tasks[:cnt]
+                if len(tasks) < cnt and not consume and char_info:
+                    # юзер задал больше, чем есть исходников — делаем столько,
+                    # сколько задано: исходники ходят по кругу, а уник всё
+                    # равно делает каждый файл уникальным (рандом на каждый
+                    # прогон: цветокор/кроп/поворот/фон/зерно/GOP)
+                    next_idx = {p: m for p, _nm, _n, m in char_info}
+                    ci = 0
+                    while len(tasks) < cnt:
+                        path, name, n, _m = char_info[ci % len(char_info)]
+                        tasks.append((path, name, next_idx[path] % n))
+                        next_idx[path] += 1
+                        ci += 1
+                else:
+                    tasks = tasks[:cnt]
             total = len(tasks)
             if total == 0:
                 self.failed.emit("Нечего собирать — 0 задач.")
@@ -4818,9 +4856,11 @@ class BatchBuildWorker(QThread):
             def build_task(task: Tuple[str, str, int]) -> Optional[str]:
                 char_folder, char_name, vid_idx = task
                 cv = list_videos(char_folder)
-                if vid_idx >= len(cv):
+                if not cv:
                     return None
-                f1 = cv[vid_idx]
+                # при дозаполнении по кругу vid_idx может быть больше
+                # количества видео — берём по модулю
+                f1 = cv[vid_idx % len(cv)]
                 vp = pick_videos(f1, char_name, vid_idx)
                 if not vp:
                     return None
